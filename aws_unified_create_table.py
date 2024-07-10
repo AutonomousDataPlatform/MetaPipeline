@@ -32,11 +32,11 @@ def unified_create_table():
 
     sql="""
 
-    CREATE TABLE IF NOT EXISTS dataset (token char(32) PRIMARY KEY, log_token char(32) NOT NULL, name varchar(75) NOT NULL, num_frames int NOT NULL, first_frame_token char(32) NOT NULL, last_frame_token char(32) NOT NULL);
+    CREATE TABLE IF NOT EXISTS dataset (token char(32) PRIMARY KEY, log_token char(32) NOT NULL, base_path varchar(75), num_frames int NOT NULL, first_frame_token char(32) NOT NULL, last_frame_token char(32) NOT NULL);
 
-    CREATE TABLE IF NOT EXISTS scenario (description varchar(35) PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS scenario (name varchar(10) PRIMARY KEY, description varchar(140));
 
-    CREATE TABLE IF NOT EXISTS scenarios_in_dataset (dataset_token char(32), scenario_description varchar(35), PRIMARY KEY (dataset_token, scenario_description));
+    CREATE TABLE IF NOT EXISTS scenarios_in_dataset (dataset_token char(32), scenario_name varchar(10), PRIMARY KEY (dataset_token, scenario_name));
 
     CREATE TABLE IF NOT EXISTS log_map (log_token char(32), map_token char(32), PRIMARY KEY (log_token, map_token));
 
@@ -52,13 +52,13 @@ def unified_create_table():
 
     CREATE TABLE IF NOT EXISTS instance (token char(32) PRIMARY KEY, category_token char(32), first_frame_annotation_token char(32), last_frame_annotation_token char(32), num_annotations int);
 
-    CREATE TABLE IF NOT EXISTS frame_data (token char(32) PRIMARY KEY, frame_token char(32), ego_pose_token char(32), calibrated_sensor_token char(32), timestamp varchar(16), is_key_frame boolean, height int, width int, file_name varchar(100), file_format char(3), prev char(32), next char(32));
+    CREATE TABLE IF NOT EXISTS frame_data (token char(32) PRIMARY KEY, frame_token char(32), ego_pose_token char(32), calibrated_sensor_token char(32), timestamp varchar(16), is_key_frame boolean, height int, width int, file_name varchar(104), file_format char(3), prev char(32), next char(32));
 
     CREATE TABLE IF NOT EXISTS map (token char(32) PRIMARY KEY, category char(14), filename char(41));
 
     CREATE TABLE IF NOT EXISTS lidarseg (token char(32) PRIMARY KEY, frame_data_token char(32), filename char(64));
 
-    CREATE TABLE IF NOT EXISTS annotation_type (name varchar(15) PRIMARY KEY, description varchar(25));
+    CREATE TABLE IF NOT EXISTS annotation_type (name varchar(19) PRIMARY KEY, description varchar(34));
 
     CREATE TABLE IF NOT EXISTS sensor (token char(32) PRIMARY KEY, channel varchar(17), modality varchar(6));
 
@@ -66,7 +66,7 @@ def unified_create_table():
 
     CREATE TABLE IF NOT EXISTS attribute (token char(32), name varchar(35), description varchar(100));
 
-    CREATE TABLE IF NOT EXISTS frame_annotation (token char(32), frame_token char(32), frame_data_token char(32), instance_token char(32), visibility_token char(1), annotation_type_name varchar(15), is_lidar_synced boolean, size_wlh json, translation_center json, rotation_orientation json, bbox_image3d json, num_lidar_pts int, num_radar_pts int, attribute_tokens json, frame_aligned int, description varchar(50), prev char(32), next char(32));
+    CREATE TABLE IF NOT EXISTS frame_annotation (token char(32), frame_token char(32), frame_data_token char(32), instance_token char(32), visibility_token char(1), annotation_type_name varchar(19), is_lidar_synced boolean, size_wlh json, translation_center json, rotation_orientation json, bbox_image3d json, num_lidar_pts int, num_radar_pts int, attribute_tokens json, frame_aligned int, description varchar(50), prev char(32), next char(32));
 
     """
 
