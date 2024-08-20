@@ -32,7 +32,7 @@ def unified_create_table():
 
     sql="""
 
-    CREATE TABLE IF NOT EXISTS dataset (token char(32) PRIMARY KEY, log_token char(32) NOT NULL, base_path varchar(75), num_frames int NOT NULL, first_frame_token char(32) NOT NULL, last_frame_token char(32) NOT NULL);
+    CREATE TABLE IF NOT EXISTS dataset (token char(32) PRIMARY KEY, type varchar(14), log_token char(32) NOT NULL, base_path varchar(75), num_frames int NOT NULL, first_frame_token char(32) NOT NULL, last_frame_token char(32) NOT NULL);
 
     CREATE TABLE IF NOT EXISTS scenario (name varchar(10) PRIMARY KEY, description varchar(140));
 
