@@ -64,6 +64,24 @@ def kakao_annotation_type_insert():
     os.remove(kakao_local_path)
 
 
+#sftp connection 을 이용하여 파일 다운로드
+#nuScenes annotation_type 테이블 데이터 삽입
+def nuScenes_annotation_type_insert():
+
+    #mysql 접속 정보
+    mysql_hook=MySqlHook.get_hook(conn_id='aws_mysql')
+    conn=mysql_hook.get_conn()
+    cur=conn.cursor()
+
+    cur.execute("use adds")
+
+    query="INSERT IGNORE INTO annotation_type (name, description) VALUES ('nuScenes_annotation', '카메라 및 라이다, 레이다 3가지에 대한 통합 어노테이션 정보')"
+    cur.execute(query)
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
 
 #sftp connection 을 이용하여 파일 다운로드
 #kakao attribute 테이블 데이터 삽입
@@ -489,6 +507,7 @@ def kakao_dataset_insert():
         #kakao dataset 테이블 데이터 삽입
         #kakao는 여러개의 데이터셋이 다른 디렉토리에 개별로 저장되어있어서 디렉토리 돌아야하고, nuScenes 는 하나의 디렉토리에 여러개의 데이터셋이 한번에 들어있음
         for dir_name in kakao_directory_list:
+            
 
             kakao_file_path=kakao_remote_path + '/' + dir_name + '/meta/dataset.json'
             sftp_client.get(kakao_file_path, kakao_local_path)
@@ -498,11 +517,14 @@ def kakao_dataset_insert():
 
                 uuid=json_data['uuid']
                 token=uuid.replace("-","")
+                
+                type='kakao_mobility'
 
                 log_uuid=json_data['log_uuid']
                 log_token=log_uuid.replace("-","")
 
-                name=json_data['name']
+                base_path=f"{json_data['name']}/sensor/"
+
                 num_frames=json_data['num_frames']
 
                 first_frame_uuid=json_data['first_frame_uuid']
@@ -511,9 +533,9 @@ def kakao_dataset_insert():
                 last_frame_uuid=json_data['last_frame_uuid']
                 last_frame_token=last_frame_uuid.replace("-","")
 
-                data=(token, log_token, name, num_frames, first_frame_token, last_frame_token)
+                data=(token, type, log_token, base_path, num_frames, first_frame_token, last_frame_token)
 
-                query="INSERT IGNORE INTO dataset (token, log_token, name, num_frames, first_frame_token, last_frame_token) VALUES (%s,%s,%s,%s,%s,%s)"
+                query="INSERT IGNORE INTO dataset (token, type, log_token, base_path, num_frames, first_frame_token, last_frame_token) VALUES (%s,%s,%s,%s,%s,%s,%s)"
 
                 cur.execute(query, data)
                 conn.commit()
@@ -553,16 +575,17 @@ def nuScenes_dataset_insert():
 
             for scene_data in json_data:
                 token=scene_data['token']
+                type='nuScenes'
                 log_token=scene_data['log_token']
+                base_path=None
                 num_frames=scene_data['nbr_samples']
                 first_frame_token=scene_data['first_sample_token']
                 last_frame_token=scene_data['last_sample_token']
-                name=scene_data['name']
                 
-                data.append((token, log_token, num_frames, first_frame_token,last_frame_token, name))
-                print(data)
+                data.append((token, type, log_token, base_path, num_frames, first_frame_token,last_frame_token))
 
-            query="INSERT IGNORE INTO dataset (token, log_token, num_frames, first_frame_token,last_frame_token, name) VALUES (%s,%s,%s,%s,%s,%s)"
+
+            query="INSERT IGNORE INTO dataset (token, type, log_token, base_path, num_frames, first_frame_token,last_frame_token) VALUES (%s,%s,%s,%s,%s,%s,%s)"
 
             cur.executemany(query,data)
             conn.commit()
@@ -725,8 +748,6 @@ def kakao_frame_annotation_insert():
 
                 for i in range(len(json_data)):
 
-                    
-
                     frame_annotation_data = json_data[i]
 
                     uuid=frame_annotation_data['uuid']
@@ -753,6 +774,7 @@ def kakao_frame_annotation_insert():
                     instance_uuid=frame_annotation_data['instance_uuid']
                     instance_token=instance_uuid.replace("-","")
 
+                    """
                     # is_visible 로 visibility_token(kakao에서의 visibility_level) 값을 넣어주기 위해서
                     # visibility 테이블의 token 값을 is_visible 에 맞게 할당함
                     # bbox_pcd3d 인 경우 geometry 에 is_visible 정보가 없기 때문에, visibility_token 정보를 취득할 수 없음. 따라서 null 처리
@@ -766,7 +788,8 @@ def kakao_frame_annotation_insert():
 
                     elif is_visible is False:
                         visibility_token="0"
-                    
+                    """
+
                     annotation_type_name=frame_annotation_data['annotation_type_name']
                     is_lidar_synced=frame_annotation_data['is_lidar_synced']
 
@@ -786,6 +809,7 @@ def kakao_frame_annotation_insert():
 
                     bbox_image3d=frame_annotation_data['geometry'].get('bbox_image3d')
                     if bbox_image3d:
+                        bbox_image3d=frame_annotation_data['geometry']
                         bbox_image3d=json.dumps(bbox_image3d)
 
                     num_lidar_pts=frame_annotation_data['num_pts']
@@ -851,7 +875,7 @@ def kakao_frame_annotation_insert():
 
                     # 처음 데이터 넣어줄때는 frame_data_token 으로 frame_token select 하면 오래걸리기 때문에 frame_token 은 넣어주지않음
                     #모든 데이터 넣어준 후에 temp 테이블을 이용해서 한번에 insert 해줌
-                    data.append((token, frame_data_token, instance_token, visibility_token, annotation_type_name, is_lidar_synced, size_wlh, translation_center, rotation_orientation, bbox_image3d, num_lidar_pts, result_attribute_token, frame_aligned, description, prev, next))
+                    data.append((token, frame_data_token, instance_token, annotation_type_name, is_lidar_synced, size_wlh, translation_center, rotation_orientation, bbox_image3d, num_lidar_pts, result_attribute_token, frame_aligned, description, prev, next))
                     #print("data append")
 
                     #50000개 단위로 insert
@@ -859,7 +883,7 @@ def kakao_frame_annotation_insert():
 
                         print("50000 data append end")
 
-                        query = "INSERT IGNORE INTO frame_annotation (token, frame_data_token, instance_token, visibility_token, annotation_type_name, is_lidar_synced, size_wlh, translation_center, rotation_orientation, bbox_image3d, num_lidar_pts, attribute_tokens, frame_aligned, description, prev, next) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                        query = "INSERT IGNORE INTO frame_annotation (token, frame_data_token, instance_token, annotation_type_name, is_lidar_synced, size_wlh, translation_center, rotation_orientation, bbox_image3d, num_lidar_pts, attribute_tokens, frame_aligned, description, prev, next) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
 
                         print("%d executemany start" %(i//50000))
                         cur.executemany(query,data)
@@ -868,7 +892,7 @@ def kakao_frame_annotation_insert():
                         data = []
 
                 # 나머지 데이터 삽입 ( 마지막 50000개까지 안 채워진 데이터 )
-                query = "INSERT IGNORE INTO frame_annotation (token, frame_data_token, instance_token, visibility_token, annotation_type_name, is_lidar_synced, size_wlh, translation_center, rotation_orientation, bbox_image3d, num_lidar_pts, attribute_tokens, frame_aligned, description, prev, next) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                query = "INSERT IGNORE INTO frame_annotation (token, frame_data_token, instance_token, annotation_type_name, is_lidar_synced, size_wlh, translation_center, rotation_orientation, bbox_image3d, num_lidar_pts, attribute_tokens, frame_aligned, description, prev, next) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
 
                 print("last executemany start")
                 cur.executemany(query,data)
@@ -932,6 +956,9 @@ def nuScenes_frame_annotation_insert():
                 frame_token=sample_annotation_data['sample_token']
                 instance_token=sample_annotation_data['instance_token']
                 visibility_token=sample_annotation_data['visibility_token']
+
+                annotation_type_name='nuScenes_annotation'
+
                 size_wlh=sample_annotation_data['size']
                 translation_center=sample_annotation_data['translation']
                 rotation_orientation=sample_annotation_data['rotation']
@@ -956,9 +983,9 @@ def nuScenes_frame_annotation_insert():
                     next=sample_annotation_data['next'].replace("-","")
 
                 
-                data.append((token, frame_token, instance_token, visibility_token, json.dumps(size_wlh), json.dumps(translation_center), json.dumps(rotation_orientation), num_lidar_pts, num_radar_pts, attribute_tokens, prev, next))
+                data.append((token, frame_token, instance_token, visibility_token, annotation_type_name, json.dumps(size_wlh), json.dumps(translation_center), json.dumps(rotation_orientation), num_lidar_pts, num_radar_pts, attribute_tokens, prev, next))
 
-            query="INSERT IGNORE INTO frame_annotation (token, frame_token, instance_token, visibility_token, size_wlh, translation_center, rotation_orientation, num_lidar_pts, num_radar_pts, attribute_tokens, prev, next) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+            query="INSERT IGNORE INTO frame_annotation (token, frame_token, instance_token, visibility_token, annotation_type_name, size_wlh, translation_center, rotation_orientation, num_lidar_pts, num_radar_pts, attribute_tokens, prev, next) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
 
             cur.executemany(query,data)
             conn.commit()
@@ -987,6 +1014,14 @@ def kakao_frame_data_insert():
 
     cur.execute("use adds")
 
+    query = "SELECT cs.token, s.channel FROM calibrated_sensor cs JOIN sensor s ON cs.sensor_token = s.token"
+    cur.execute(query)
+    combined_sensor_data=cur.fetchall()
+
+    combined_sensor_dict={calibrated_sensor_token: channel for calibrated_sensor_token, channel in combined_sensor_data}
+
+
+
     with hook.get_conn() as sftp_client:
 
         #kakao dataset 테이블 데이터 삽입
@@ -1012,8 +1047,8 @@ def kakao_frame_data_insert():
                     ego_pose_uuid=frame_data_data['ego_pose_uuid']
                     ego_pose_token=ego_pose_uuid.replace("-","")
 
-                    sensor_uuid=frame_data_data['sensor_uuid']
-                    calibrated_sensor_token=sensor_uuid.replace("-","")
+                    calibrated_sensor_uuid=frame_data_data['sensor_uuid']
+                    calibrated_sensor_token=calibrated_sensor_uuid.replace("-","")
 
                     timestamp=frame_data_data['timestamp']
                     is_key_frame=frame_data_data['is_key_frame']
@@ -1028,7 +1063,8 @@ def kakao_frame_data_insert():
                     else:
                         width=frame_data_data['width']
                     
-                    file_name=frame_data_data['file_name']
+                    file_name=f"{combined_sensor_dict[calibrated_sensor_token]}/{frame_data_data['file_name']}.{frame_data_data['file_format']}"
+
                     file_format=frame_data_data['file_format']
 
                     if frame_data_data['prev']:
@@ -1565,23 +1601,18 @@ def kakao_log_map_insert():
 
                 map_uuids=json_data['map_uuids']
 
-                if map_uuids==None:
-                    map_token=None
-                    data.append((log_token, map_token))
-
-                
-                #log 테이블의 map_uuids 가 null 값이 아닌 배열인 경우를 위해
-                else:
+                #log 테이블의 map_uuids 가 null 값이 아닌 배열인 경우에만 삽입
+                if map_uuids!=None:
                     for map_uuid in map_uuids:
                         #uuid 형식을 token 형식으로 변환해주어서 저장해야함
                         map_token=map_uuid.replace("-","")
-                        data.append((log_token,map_token))
-                
+                        data.append((log_token, map_token))
+     
 
-                query="INSERT IGNORE INTO log_map (log_token, map_token) VALUES (%s,%s)"
+                    query="INSERT IGNORE INTO log_map (log_token, map_token) VALUES (%s,%s)"
 
-                cur.executemany(query,data)
-                conn.commit()
+                    cur.executemany(query,data)
+                    conn.commit()
 
     cur.close()
     conn.close()
@@ -1680,7 +1711,6 @@ def nuScenes_map_insert():
     os.remove(nuScenes_local_path)
 
 
-
 #sftp connection 을 이용하여 파일 다운로드
 #scenario 테이블 데이터 삽입
 def kakao_scenario_insert():
@@ -1700,6 +1730,8 @@ def kakao_scenario_insert():
 
     with hook.get_conn() as sftp_client:
 
+        num = 1
+
         #kakao scenario 테이블 데이터 삽입
         #kakao는 여러개의 데이터셋이 다른 디렉토리에 개별로 저장되어있어서 디렉토리 돌아야하고, nuScenes 는 하나의 디렉토리에 여러개의 데이터셋이 한번에 들어있음
         for dir_name in kakao_directory_list:
@@ -1709,16 +1741,21 @@ def kakao_scenario_insert():
 
             with open(kakao_local_path) as f:
                 json_data=json.load(f)
-                json_data2=json_data['scenario_names']
 
-                data=[]
-                for scenario_data_name in json_data2:
-                    data.append(scenario_data_name)
+                # nuScenes 처럼 scene 넘버로 name 변경
+                name=f"scene-{format(num,'04')}"
 
-                query="INSERT IGNORE INTO scenario (description) VALUES (%s)"
+                # scenario_names 엮어서 nuScenes 처럼 description 으로
+                description=", ".join(json_data['scenario_names'])
 
-                cur.executemany(query, data)
+                data=(name, description)
+
+                query="INSERT IGNORE INTO scenario (name, description) VALUES (%s, %s)"
+
+                cur.execute(query, data)
                 conn.commit()
+
+            num+=1
 
     cur.close()
     conn.close()
@@ -1744,7 +1781,6 @@ def nuScenes_scenario_insert():
 
     with hook.get_conn() as sftp_client:
 
-        nuScenes_local_path='scene.json'
         nuScenes_file_path=nuScenes_remote_path + '/scene.json'
         sftp_client.get(nuScenes_file_path, nuScenes_local_path)
 
@@ -1754,12 +1790,12 @@ def nuScenes_scenario_insert():
             data=[]
 
             for scene_data in json_data:
-                scene_description=scene_data['description']
+                name=scene_data['name']
+                description=scene_data['description']
 
-                #scene 에 대한 n개의 설명이 하나의 문자열로 저장되어있는 description 을 ','로 구분해서 개별 데이터로 넣어줌
-                data.extend((item.strip(),) for item in scene_description.split(','))
+                data.append((name,description))
 
-            query="INSERT IGNORE INTO scenario (description) VALUES (%s)"
+            query="INSERT IGNORE INTO scenario (name, description) VALUES (%s, %s)"
 
             cur.executemany(query,data)
             conn.commit()
@@ -1790,6 +1826,8 @@ def kakao_scenarios_in_dataset_insert():
 
     with hook.get_conn() as sftp_client:
 
+        num = 1
+
         #kakao scenario 테이블 데이터 삽입
         #kakao는 여러개의 데이터셋이 다른 디렉토리에 개별로 저장되어있어서 디렉토리 돌아야하고, nuScenes 는 하나의 디렉토리에 여러개의 데이터셋이 한번에 들어있음
         for dir_name in kakao_directory_list:
@@ -1800,34 +1838,20 @@ def kakao_scenarios_in_dataset_insert():
             with open(kakao_local_path) as f:
                 json_data=json.load(f)
 
-                data=[]
 
-                #dataset이 여러개인 경우 (json 배열)을 위해
-                if isinstance(json_data,list):
-                    for dataset_data in json_data:
+                dataset_uuid=json_data['uuid']
+                dataset_token=dataset_uuid.replace("-","")
 
-                        dataset_uuid=dataset_data['uuid']
-                        #uuid를 nuScenes 의 token 형식으로 바꿈
-                        dataset_token=dataset_uuid.replace("-","")
+                scenario_name=f"scene-{format(num,'04')}"
 
-                        scenario_names=dataset_data['scenario_names']
+                data=(dataset_token, scenario_name)
 
-                    for scenario_description in scenario_names:
+                query="INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_name) VALUES (%s,%s)"
 
-                        data.append((dataset_token,scenario_description))
-                else:
-                    dataset_uuid=json_data['uuid']
-                    dataset_token=dataset_uuid.replace("-","")
-
-                    scenario_names=json_data['scenario_names']
-                    for scenario_description in scenario_names:
-
-                        data.append((dataset_token,scenario_description))
-
-                query="INSERT IGNORE INTO scenarios_in_dataset (dataset_token,scenario_description) VALUES (%s,%s)"
-
-                cur.executemany(query,data)
+                cur.execute(query,data)
                 conn.commit()
+
+            num+=1
 
     cur.close()
     conn.close()
@@ -1862,13 +1886,14 @@ def nuScenes_scenarios_in_dataset_insert():
             data=[]
 
             for scene_data in json_data:
-                scene_token=scene_data['token']
-                scene_description=scene_data['description']
 
-                data.extend((scene_token, item.strip()) for item in scene_description.split(','))
+                dataset_token=scene_data['token']
+                scene_name=scene_data['name']
+
+                data.append((dataset_token, scene_name))
 
 
-            query="INSERT IGNORE INTO scenarios_in_dataset (dataset_token,scenario_description) VALUES (%s,%s)"
+            query="INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_name) VALUES (%s,%s)"
 
             cur.executemany(query,data)
             conn.commit()
@@ -2096,7 +2121,9 @@ with DAG('aws_unified_insert',
         default_args=default_args,
         schedule_interval=None,
         )as dag:
+
     kakao_annotation_type_insert=PythonOperator(task_id='kakao_annotation_type_insert', python_callable=kakao_annotation_type_insert)
+    nuScenes_annotation_type_insert=PythonOperator(task_id='nuScenes_annotation_type_insert', python_callable=nuScenes_annotation_type_insert)
     kakao_attribute_insert=PythonOperator(task_id='kakao_attribute_insert', python_callable=kakao_attribute_insert)
     nuScenes_attribute_insert=PythonOperator(task_id='nuScenes_attribute_insert', python_callable=nuScenes_attribute_insert)
     kakao_calibrated_sensor_insert=PythonOperator(task_id='kakao_calibrated_sensor_insert', python_callable=kakao_calibrated_sensor_insert)
@@ -2133,7 +2160,7 @@ with DAG('aws_unified_insert',
 
 # nuScenes 태스크들을 그룹화
 nuScenes_tasks = [
-    nuScenes_attribute_insert, nuScenes_calibrated_sensor_insert, nuScenes_category_insert,
+    nuScenes_annotation_type_insert, nuScenes_attribute_insert, nuScenes_calibrated_sensor_insert, nuScenes_category_insert,
     nuScenes_dataset_insert, nuScenes_ego_pose_insert, nuScenes_frame_data_insert,
     nuScenes_frame_insert, nuScenes_instance_insert, nuScenes_lidarseg_insert,
     nuScenes_log_insert, nuScenes_log_map_insert, nuScenes_map_insert,
@@ -2168,4 +2195,3 @@ for task in kakao_tasks:
 
 # 나머지 태스크들의 종속성 설정
 kakao_end >> kakao_calibrated_sensor_insert >> kakao_instance_insert >> kakao_frame_annotation_insert >> nuScenes_frame_annotation_insert
-
