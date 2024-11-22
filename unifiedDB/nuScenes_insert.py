@@ -58,6 +58,11 @@ def attribute_insert():
 
     os.remove(local_path)
 
+    cur.close()
+    conn.close()
+
+    os.remove(local_path)
+
 
 #sftp connection 을 이용하여 파일 다운로드
 #calibrated_sensor 테이블 데이터 삽입
@@ -621,14 +626,14 @@ def scene_insert():
             json_data=json.load(f)
             data=[]
             
-            for scene_annotation_data in json_data:
-                token=scene_annotation_data['token']
-                log_token=scene_annotation_data['log_token']
-                nbr_samples=scene_annotation_data['nbr_samples']
-                first_sample_token=scene_annotation_data['first_sample_token']
-                last_sample_token=scene_annotation_data['last_sample_token']
-                name=scene_annotation_data['name']
-                description=scene_annotation_data['description']
+            for scene_data in json_data:
+                token=scene_data['token']
+                log_token=scene_data['log_token']
+                nbr_samples=scene_data['nbr_samples']
+                first_sample_token=scene_data['first_sample_token']
+                last_sample_token=scene_data['last_sample_token']
+                name=scene_data['name']
+                description=scene_data['description']
                 
                 data.append((token, log_token, nbr_samples, first_sample_token,last_sample_token, name, description))
 

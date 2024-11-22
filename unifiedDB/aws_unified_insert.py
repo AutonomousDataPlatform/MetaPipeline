@@ -8,6 +8,8 @@ from airflow.operators.empty import EmptyOperator
 import json
 import os
 import secrets
+from airflow.decorators import task
+import pymysql
 
 default_args={
         'owner':'eun',
@@ -2116,6 +2118,79 @@ def nuScenes_visibility_insert():
     conn.close()
     os.remove(nuScenes_local_path)
 
+# get_chunk_parameters 와 attribute_frame_annotation_insert 태스크는 attribute 와 frame_annotation 의 JOIN 테이블에 insert 하는 태스크
+# get_chunk_parameters 는 batch 수 구하기 위함.
+@task
+def get_chunk_parameters(**kwargs):
+    
+    def get_total_count():
+        conn_info = MySqlHook.get_connection(conn_id='aws_mysql')
+        connection = pymysql.connect(
+            host=conn_info.host,
+            user=conn_info.login,
+            password=conn_info.password,
+            db='adds',
+            port=conn_info.port,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = connection.cursor()
+        cursor.execute("SELECT COUNT(*) as count FROM frame_annotation")
+        result = cursor.fetchone()
+        total_count = result['count']
+        cursor.close()
+        connection.close()
+
+        return total_count
+    
+    total_count=get_total_count()
+    
+
+    ti=kwargs['ti']
+    ti.xcom_push(key='total_count', value=total_count)
+
+    num_tasks = (total_count + 199999) // 200000
+
+    return [{"batch_number":i} for i in range(num_tasks)]
+
+
+def attribute_frame_annotation_insert(batch_number):
+
+    conn_info = MySqlHook.get_connection(conn_id='aws_mysql')
+
+    connection = pymysql.connect(
+        host=conn_info.host,
+        user=conn_info.login,
+        password=conn_info.password,
+        db='adds',
+        port=conn_info.port,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False
+    )
+    
+    page_size = 200000
+    offset = batch_number * page_size
+
+    cursor = connection.cursor()
+    cursor.execute(f"SELECT * FROM frame_annotation LIMIT {offset}, {page_size}")
+    results = cursor.fetchall()
+    
+    data = []
+
+    for row in results:
+        frame_annotation_token = row['token']
+        if row['attribute_tokens']:
+            attribute_token_list = json.loads(row['attribute_tokens'])
+            for attribute_token in attribute_token_list:
+                data.append((attribute_token, frame_annotation_token))
+
+    query = "INSERT IGNORE INTO attribute_frame_annotation (attribute_token, frame_annotation_token) VALUES (%s, %s)"
+    cursor.executemany(query, data)
+
+    connection.commit()
+
+    cursor.close()
+    connection.close()
+
 
 with DAG('aws_unified_insert',
         default_args=default_args,
@@ -2157,6 +2232,9 @@ with DAG('aws_unified_insert',
     kakao_visibility_insert=PythonOperator(task_id='kakao_visibility_insert', python_callable=kakao_visibility_insert)
     nuScenes_visibility_insert=PythonOperator(task_id='nuScenes_visibility_insert', python_callable=nuScenes_visibility_insert)
 
+    chunk_params = get_chunk_parameters()
+
+    attribute_frame_annotation_insert=PythonOperator.partial(task_id='process_batch', python_callable=attribute_frame_annotation_insert).expand(op_kwargs=chunk_params)
 
 # nuScenes 태스크들을 그룹화
 nuScenes_tasks = [
@@ -2194,4 +2272,4 @@ for task in kakao_tasks:
     kakao_start >> task >> kakao_end
 
 # 나머지 태스크들의 종속성 설정
-kakao_end >> kakao_calibrated_sensor_insert >> kakao_instance_insert >> kakao_frame_annotation_insert >> nuScenes_frame_annotation_insert
+kakao_end >> kakao_calibrated_sensor_insert >> kakao_instance_insert >> kakao_frame_annotation_insert >> nuScenes_frame_annotation_insert >> chunk_params >> attribute_frame_annotation_insert

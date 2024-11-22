@@ -126,10 +126,14 @@ def annotation_type_insert():
     cur.execute("use kakao_mobility")
 
     with hook.get_conn() as sftp_client:
+
         for dir_name in directory_list:
+
             file_path=remote_path + '/' + dir_name + '/meta/preset.json'
             sftp_client.get(file_path, local_path)
+
             with open(local_path) as f:
+                
                 json_data=json.load(f)
                 annotation_type_data=json_data['annotation_type']['contents']
                 data=[]
@@ -532,7 +536,9 @@ def frame_data_insert():
         for dir_name in directory_list:
             file_path=remote_path + '/' + dir_name + '/meta/frame_data.json'
             sftp_client.get(file_path, local_path)
+
             with open(local_path) as f:
+
                 json_data=json.load(f)
                 data=[]
                 for frame_data_data in json_data:

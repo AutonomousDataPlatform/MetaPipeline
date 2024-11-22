@@ -68,6 +68,8 @@ def unified_create_table():
 
     CREATE TABLE IF NOT EXISTS frame_annotation (token char(32), frame_token char(32), frame_data_token char(32), instance_token char(32), visibility_token char(1), annotation_type_name varchar(19), is_lidar_synced boolean, size_wlh json, translation_center json, rotation_orientation json, bbox_image3d json, num_lidar_pts int, num_radar_pts int, attribute_tokens json, frame_aligned int, description varchar(50), prev char(32), next char(32));
 
+    CREATE TABLE IF NOT EXISTS attribute_frame_annotation (`attribute_token` char(32) NOT NULL, `frame_annotation_token` char(32) NOT NULL);
+
     """
 
     cur.execute(sql)
