@@ -6,6 +6,11 @@
 - airflow 의 connections 는 DAG 실행 전 미리 생성
   - sftp connection (meta data 존재하는 서버)
   - mysql connection (DB 서버)
+ 
+- airflow metadb
+  - mysql 이나 postgresql 등으로 변경
+- airflow executor
+  - localexecutor 로 변경
 
 
 ## 2. Json Export
