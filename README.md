@@ -4,6 +4,8 @@
 
 ### Requirements
 - airflow 의 connections 는 DAG 실행 전 미리 생성
+  - sftp connection (meta data 존재하는 서버)
+  - mysql connection (DB 서버)
 
 
 ## 2. Json Export
