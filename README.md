@@ -2,6 +2,11 @@
 ### Dependencies
 - airflow 2.9.3
 
+## Run
+1. airflow 설치 후에 생성된 airflow 디렉토리 아래에 dags 폴더 생성
+2. unifiedDB 에 있는 dag 파일들을 넣어줌
+
+
 ### Requirements
 - airflow 의 connections 는 DAG 실행 전 미리 생성
   - sftp connection (meta data 존재하는 서버)
