@@ -9,8 +9,18 @@
  
 - airflow metadb
   - mysql 이나 postgresql 등으로 변경
+ 
+    *airflow.cfg*
+    ```
+    sql_alchemy_conn = mysql+mysqldb://<user>:<password>@<host>:3306/<dbname>
+    ```
 - airflow executor
   - localexecutor 로 변경
+ 
+    *airflow.cfg*
+    ```
+    executor = LocalExecutor
+    ```
 
 
 ## 2. Json Export
