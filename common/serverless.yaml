@@ -1,0 +1,58 @@
+service: aws_infra
+
+resources:
+  Resources:
+    slsTestBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: slstestbucket
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    S3VPCEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName: com.amazonaws.ap-northeast-2.s3
+        VpcId: vpc-0535b54bd4855f4d5
+        RouteTableIds:
+          - rtb-0883fe4f932151bfc
+        VpcEndpointType: Gateway
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action: 
+                - 's3:GetObject'
+                - 's3:PutObject'
+                - 's3:ListBucket'
+                - 's3:DeleteObject'
+                - 's3:AbortMultipartUpload'
+              Resource:
+                - 'arn:aws:s3:::adds-json/*'
+                - 'arn:aws:s3:::adds-json'
+
+    StepFunctionsVPCEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName: com.amazonaws.ap-northeast-2.states
+        VpcId: vpc-0535b54bd4855f4d5
+        SubnetIds:
+          - subnet-0f9f617d0e5f127fd
+          - subnet-07c1f65ad8a5d4fc2
+        VpcEndpointType: Interface
+        SecurityGroupIds:
+          - sg-062fc049c54582564
+        PrivateDnsEnabled: true
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action:
+                - states:DescribeExecution
+                - states:StartExecution
+              Resource: '*'
