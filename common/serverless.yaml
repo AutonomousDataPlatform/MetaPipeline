@@ -2,16 +2,6 @@ service: aws_infra
 
 resources:
   Resources:
-    slsTestBucket:
-      Type: AWS::S3::Bucket
-      Properties:
-        BucketName: slstestbucket
-        PublicAccessBlockConfiguration:
-          BlockPublicAcls: true
-          BlockPublicPolicy: true
-          IgnorePublicAcls: true
-          RestrictPublicBuckets: true
-
     S3VPCEndpoint:
       Type: AWS::EC2::VPCEndpoint
       Properties:

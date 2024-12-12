@@ -1,0 +1,218 @@
+service: lambda-deploy-test
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-step-functions
+
+provider:
+  name: aws
+  region: ap-northeast-2
+  stage: ${opt:stage, 'dev'}
+  environment:
+    STAGE: ${self:provider.stage}
+
+  runtime: python3.10
+  vpc:
+    securityGroupIds:
+      - sg-04622c208588a262c
+    subnetIds:
+      - subnet-0f9f617d0e5f127fd
+      - subnet-07c1f65ad8a5d4fc2
+  timeout: 600
+
+  apiGateway:
+    apiKeys:
+      - Apikey # API gateway 인증키
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - 's3:GetObject'
+            - 's3:PutObject'
+            - 's3:ListBucket'
+            - 's3:DeleteObject'
+            - 's3:AbortMultipartUpload'
+          Resource:
+            - 'arn:aws:s3:::adds-json/*'
+            - 'arn:aws:s3:::adds-json'
+
+        - Effect: Allow
+          Action:
+          - states:DescribeExecution
+          - states:StartExecution
+          Resource: '*'
+
+resources:
+  Resources:
+    adds-json:
+      Type: AWS::S3::Bucket
+      Properties:
+        #BucketName: # stage 별 버킷 생성
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+functions:
+  filtering1Lambda:
+    timeout: 900
+    handler: filtering1.lambda_handler
+    layers:
+      - arn:aws:lambda:ap-northeast-2:339713009546:layer:pymysql_layer:3
+
+  filteringfaLambda:
+    timeout: 900
+    handler: filteringfa.lambda_handler
+    layers:
+      - arn:aws:lambda:ap-northeast-2:339713009546:layer:pymysql_layer:3
+
+  filtering2Lambda:
+    timeout: 900
+    handler: filtering2.lambda_handler
+    layers:
+      - arn:aws:lambda:ap-northeast-2:339713009546:layer:pymysql_layer:3
+
+  dbToJsonLambda:
+    handler: db_json_exporter.lambda_handler
+    layers:
+      - arn:aws:lambda:ap-northeast-2:339713009546:layer:pymysql_layer:3
+
+  countLambda:
+    handler: count.lambda_handler
+    layers:
+      - arn:aws:lambda:ap-northeast-2:339713009546:layer:pymysql_layer:3
+
+  batchLambda:
+    handler: batch.lambda_handler
+    layers:
+      - arn:aws:lambda:ap-northeast-2:339713009546:layer:pymysql_layer:3
+
+  mergeLambda:
+    handler: merge.lambda_handler
+    layers:
+      - arn:aws:lambda:ap-northeast-2:339713009546:layer:pymysql_layer:3
+
+  droptableLambda:
+    handler: drop_temp_table.lambda_handler
+    layers:
+      - arn:aws:lambda:ap-northeast-2:339713009546:layer:pymysql_layer:3
+
+  sfnStartLambda:
+    handler: sfnStart.lambda_handler
+    events:
+      - http:
+          path: /export
+          method: POST
+          private: true # API Key 인증 활성화
+    vpc:
+      securityGroupIds:
+        - sg-062fc049c54582564
+      subnetIds:
+        - subnet-0f9f617d0e5f127fd
+        - subnet-07c1f65ad8a5d4fc2
+
+  monitoringLambda:
+    handler: monitoring.lambda_handler
+    events:
+      - http:
+          path: /monitoring
+          method: POST
+          private: true # API Key 인증 활성화
+    vpc:
+      securityGroupIds:
+        - sg-062fc049c54582564
+      subnetIds:
+        - subnet-0f9f617d0e5f127fd
+        - subnet-07c1f65ad8a5d4fc2
+  
+  zipLambda:
+    handler: zip.lambda_handler
+
+stepFunctions:
+  stateMachines:
+    batchProcessStateMachine:
+      definition:
+        StartAt: Filtering1
+        States:
+          Filtering1:
+            Type: Task
+            Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-filtering1Lambda
+            Next: Filteringfa
+          
+          Filteringfa:
+            Type: Map
+            MaxConcurrency: 1
+            ItemsPath: "$.batch_number"
+            Iterator:
+              StartAt: BatchLambda
+              States:
+                BatchLambda:
+                  Type: Task
+                  Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-filteringfaLambda
+                  Parameters:
+                    "batch_number.$": "$"
+                  End: true
+            Next: Filtering2
+
+          Filtering2:
+            Type: Task
+            Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-filtering2Lambda
+            Next: ParallelProcessing
+
+          ParallelProcessing:
+            Type: Parallel
+            Next: Droptable
+            Branches:
+              - StartAt: DbToJson
+                States:
+                  DbToJson:
+                    Type: Task
+                    Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-dbToJsonLambda
+                    Parameters:
+                      "executionArn.$": "$$.Execution.Id"  # Step Functions 실행 ARN
+                    End: true
+
+              - StartAt: GetBatchNumbers
+                States:
+                  GetBatchNumbers:
+                    Type: Task
+                    Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-countLambda
+                    Next: DynamicLambdaExecutions
+
+                  DynamicLambdaExecutions:
+                    Type: Map
+                    MaxConcurrency: 20
+                    ItemsPath: "$.batch_number"
+                    Iterator:
+                      StartAt: InvokeLambda
+                      States:
+                        InvokeLambda:
+                          Type: Task
+                          Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-batchLambda
+                          Parameters:
+                            "batch_number.$": "$"
+                            "executionArn.$": "$$.Execution.Id"  # Step Functions 실행 ARN
+                          End: true
+                    Next: MergeBatchFiles
+
+                  MergeBatchFiles:
+                    Type: Task
+                    Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-mergeLambda
+                    Parameters:
+                      "executionArn.$": "$$.Execution.Id"  # Step Functions 실행 ARN
+                    End: true
+          
+          Droptable:
+            Type: Task
+            Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-droptableLambda
+            Next: Zipfile
+
+          Zipfile:
+            Type: Task
+            Resource: arn:aws:lambda:ap-northeast-2:339713009546:function:lambda-deploy-test-${self:provider.stage}-zipLambda
+            Parameters:
+              "executionArn.$": "$$.Execution.Id"  # Step Functions 실행 ARN
+            End: true
