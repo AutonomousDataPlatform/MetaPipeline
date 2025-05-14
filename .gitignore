@@ -1,0 +1,6 @@
+test_ETL_kakao.py
+test_mysql_connection.py
+test_mysql_hook_connection.py
+test_sftp_connection.py
+__pycache__/*
+utils/__pycache__/*
