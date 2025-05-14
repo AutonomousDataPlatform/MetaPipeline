@@ -6,43 +6,43 @@ from airflow.providers.mysql.hooks.mysql import MySqlHook
 import pymysql
 from pymysql.constants import CLIENT
 
-default_args={
+default_args = {
         'owner':'eun',
         'retries':1,
-        'retry_delay':timedelta(minutes=5),
+        'retry_delay':timedelta(minutes = 5),
 }
 
 
-def unified_create_table():
+def create_table():
     
     #mysql 접속 정보
-    mysql_hook=MySqlHook(conn_id="aws_mysql")
-    conn_info=mysql_hook.get_connection(conn_id="aws_mysql")
-    conn=pymysql.connect(
-        host=conn_info.host,
-        user=conn_info.login,
-        password=conn_info.password,
-        db='adds',
-        port=conn_info.port,
-        client_flag=CLIENT.MULTI_STATEMENTS,
-        autocommit=False
+    mysql_hook = MySqlHook(conn_id = "aws_mysql")
+    conn_info = mysql_hook.get_connection(conn_id = "aws_mysql")
+    conn = pymysql.connect(
+        host = conn_info.host,
+        user = conn_info.login,
+        password = conn_info.password,
+        db = 'fusion3d',
+        port = conn_info.port,
+        client_flag = CLIENT.MULTI_STATEMENTS,
+        autocommit = False
     )
 
-    cur=conn.cursor()
+    cur = conn.cursor()
 
-    sql="""
+    sql = """
 
-    CREATE TABLE IF NOT EXISTS dataset (token char(32) PRIMARY KEY, type varchar(14), log_token char(32) NOT NULL, base_path varchar(75), num_frames int NOT NULL, first_frame_token char(32) NOT NULL, last_frame_token char(32) NOT NULL);
+    CREATE TABLE IF NOT EXISTS dataset (token char(32) PRIMARY KEY, type varchar(14), log_token char(32), base_path varchar(200), num_frames int, first_frame_token char(32), last_frame_token char(32));
 
-    CREATE TABLE IF NOT EXISTS scenario (name varchar(10) PRIMARY KEY, description varchar(140));
+    CREATE TABLE IF NOT EXISTS scenario (token char(32) PRIMARY KEY, description varchar(140));
 
-    CREATE TABLE IF NOT EXISTS scenarios_in_dataset (dataset_token char(32), scenario_name varchar(10), PRIMARY KEY (dataset_token, scenario_name));
+    CREATE TABLE IF NOT EXISTS scenarios_in_dataset (dataset_token char(32), scenario_token char(32), PRIMARY KEY (dataset_token, scenario_token));
 
     CREATE TABLE IF NOT EXISTS log_map (log_token char(32), map_token char(32), PRIMARY KEY (log_token, map_token));
 
     CREATE TABLE IF NOT EXISTS frame (token char(32) PRIMARY KEY, timestamp varchar(16), dataset_token char(32), prev char(32), next char(32));
 
-    CREATE TABLE IF NOT EXISTS ego_pose (token char(32) PRIMARY KEY, timestamp varchar(16), translation json, rotation json, coordinate_system json);
+    CREATE TABLE IF NOT EXISTS ego_pose (token char(32) PRIMARY KEY, timestamp varchar(16), translation json, rotation json, coordinate_system json, pose_type varchar(7));
 
     CREATE TABLE IF NOT EXISTS log (token char(32) PRIMARY KEY, device varchar(26), date_captured varchar(19), location varchar(24), driving_distance decimal(17,13), device_wlh json, logfile char(29));
 
@@ -64,9 +64,9 @@ def unified_create_table():
 
     CREATE TABLE IF NOT EXISTS calibrated_sensor (token char(32) PRIMARY KEY, sensor_token char(32), translation json, rotation json, camera_intrinsic json, height_from_ground decimal(17,16));
 
-    CREATE TABLE IF NOT EXISTS attribute (token char(32), name varchar(35), description varchar(100));
+    CREATE TABLE IF NOT EXISTS attribute (token char(32), name varchar(35) UNIQUE, description varchar(100));
 
-    CREATE TABLE IF NOT EXISTS frame_annotation (token char(32), frame_token char(32), frame_data_token char(32), instance_token char(32), visibility_token char(1), annotation_type_name varchar(19), is_lidar_synced boolean, size_wlh json, translation_center json, rotation_orientation json, bbox_image3d json, num_lidar_pts int, num_radar_pts int, attribute_tokens json, frame_aligned int, description varchar(50), prev char(32), next char(32));
+    CREATE TABLE IF NOT EXISTS frame_annotation (token char(32), frame_token char(32), frame_data_token char(32), instance_token char(32), visibility_token char(1), annotation_type_name varchar(19), is_lidar_synced boolean, size_wlh json, translation_center json, rotation_orientation json, bbox_image3d json, bbox_image2d json, num_lidar_pts int, num_radar_pts int, attribute_tokens json, frame_aligned int, description varchar(50), prev char(32), next char(32));
 
     CREATE TABLE IF NOT EXISTS attribute_frame_annotation (`attribute_token` char(32) NOT NULL, `frame_annotation_token` char(32) NOT NULL);
 
@@ -79,11 +79,8 @@ def unified_create_table():
     conn.close()
 
 
-with DAG('aws_unified_create_table',
-        default_args=default_args,
-        schedule_interval=None,
+with DAG('create_table',
+        default_args = default_args,
+        schedule_interval = None,
         )as dag:
-    unified_create_table=PythonOperator(task_id='unified_create_table', python_callable=unified_create_table)
-
-
-unified_create_table
+    create_table_task = PythonOperator(task_id = 'create_table', python_callable = create_table)
