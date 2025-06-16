@@ -26,13 +26,11 @@ def prepare_local_dir(dir_name):
     os.makedirs(local_dir, exist_ok=True)
     return local_dir
 
+
 def cleanup_dirs():
     base_path = "3D_object_detection_tracking(infra_edge)"
     if os.path.exists(base_path):
-        for dir_name in os.listdir(base_path):
-            dir_path = os.path.join(base_path, dir_name)
-            if os.path.isdir(dir_path):
-                shutil.rmtree(dir_path)
+        shutil.rmtree(base_path)
 
 
 def annotation_type_insert():
@@ -209,8 +207,6 @@ def attribute_insert():
     conn.close()
 
 
-# FIXME: sensor의 channel은 통합 DB 기준으로 가져와야함.
-# FIXME: sensor의 channel 처음에 세팅. 반복마다 select 쿼리로 channel 가져오지 XX 반복마다 select 쿼리 실행하면 부하걸림.
 def calibrated_sensor_insert():
 
     # sftp 접속 정보
@@ -1068,72 +1064,6 @@ def scenario_insert():
     mysql_hook = MySqlHook.get_hook(conn_id='aws_mysql')
     conn = mysql_hook.get_conn()
     cur = conn.cursor()
-    cur.execute("USE infra3d")
-
-    # insert 대상 누적 리스트
-    scenario_data = []
-    scenarios_in_dataset_data = []
-
-    with hook.get_conn() as sftp_client:
-        for dir_name in kakao_directory_list:
-            local_dir = prepare_local_dir(dir_name)
-            local_path = f"{local_dir}/scenario_dataset.json"
-            file_path = f"{kakao_remote_path}/{dir_name}/meta/dataset.json"
-
-            try:
-                sftp_client.get(file_path, local_path)
-            except Exception as e:
-                print(f"[경고] dataset.json 다운로드 실패: {file_path} / {e}")
-                continue
-
-            with open(local_path, "r", encoding="utf-8") as f:
-                json_data = json.load(f)
-
-                # 랜덤 token 사용
-                scenario_token = secrets.token_hex(16)
-                description = ", ".join(json_data.get("scenario_names", []))
-
-                dataset_uuid = json_data.get("uuid", "")
-                dataset_token = dataset_uuid.replace("-", "")
-
-                # insert용 데이터 누적
-                scenario_data.append((scenario_token, description))
-                scenarios_in_dataset_data.append((dataset_token, scenario_token))
-
-            # **방금 쓴 파일·디렉터리 즉시 삭제**
-            os.remove(local_path)
-    
-    print(f"scenario 데이터 ::::: {scenario_data}")
-    print(f"sceanrios_in_dataset 데이터 ::::: {scenarios_in_dataset_data}")
-    
-    # 한 번만 insert
-    if scenario_data:
-        cur.executemany(
-            "INSERT IGNORE INTO scenario (token, description) VALUES (%s, %s)",
-            scenario_data
-        )
-
-    if scenarios_in_dataset_data:
-        cur.executemany(
-            "INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_token) VALUES (%s, %s)",
-            scenarios_in_dataset_data
-        )
-
-    conn.commit()
-
-    cur.close()
-    conn.close()
-
-
-def scenario_insert():
-
-    # SFTP 및 MySQL 접속
-    hook = SFTPHook(ssh_conn_id="eun_sftp")
-    kakao_directory_list = hook.list_directory(kakao_remote_path)
-
-    mysql_hook = MySqlHook.get_hook(conn_id='aws_mysql')
-    conn = mysql_hook.get_conn()
-    cur = conn.cursor()
 
     # adds DB에서 기존 scenario description → token 맵 조회
     cur.execute("USE adds")
@@ -1413,6 +1343,7 @@ def copy_to_adds():
     tables = [
         'annotation_type',
         'attribute',
+        'attribute_frame_annotation',
         'calibrated_sensor',
         'ego_pose',
         'instance',
