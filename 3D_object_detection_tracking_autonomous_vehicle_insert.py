@@ -30,10 +30,7 @@ def prepare_local_dir(dir_name):
 def cleanup_dirs():
     base_path = "3D_object_detection_tracking(autonomous_vehicle)"
     if os.path.exists(base_path):
-        for dir_name in os.listdir(base_path):
-            dir_path = os.path.join(base_path, dir_name)
-            if os.path.isdir(dir_path):
-                shutil.rmtree(dir_path)
+        shutil.rmtree(base_path)
 
 
 def annotation_type_insert():
@@ -429,7 +426,7 @@ def sensor_insert():
                 cur.executemany(query, filtered_data)
                 conn.commit()
 
-            # 3) **방금 쓴 파일·디렉터리 즉시 삭제**
+            # **방금 쓴 파일·디렉터리 즉시 삭제**
             os.remove(local_path)
 
     cur.close()
@@ -925,94 +922,6 @@ def frame_insert():
 
 def instance_insert():
 
-    #sftp 접속 정보
-    hook = SFTPHook(ssh_conn_id = "eun_sftp")
-    kakao_directory_list = hook.list_directory(kakao_remote_path)
-
-    #mysql 접속 정보
-    mysql_hook = MySqlHook.get_hook(conn_id = 'aws_mysql')
-    conn = mysql_hook.get_conn()
-    cur = conn.cursor()
-
-    cur.execute("use av3d")
-
-    category_name_list = []
-    category_dict = {}
-    
-    with hook.get_conn() as sftp_client:
-
-        for dir_name in kakao_directory_list:
-
-            local_dir = prepare_local_dir(dir_name)
-            local_path = f"{local_dir}/instance.json"
-            file_path = f"{kakao_remote_path}/{dir_name}/meta/instance.json"
-
-            sftp_client.get(file_path, local_path)
-
-            with open(local_path) as f:
-                json_data = json.load(f)
-
-                data = []
-
-                for instance_data in json_data:
-
-                    uuid = instance_data['uuid']
-                    token = uuid.replace("-","")
-
-                    category_name = instance_data['category_name']
-                    sql = "SELECT token FROM category WHERE name = %s"  # 이렇게 매번 select 쿼리 실행하면 부하가 심해지고 느려짐. ==> 반복문 안에서 쿼리 실행은 지양하는 것이 좋음.
-                    param = (category_name,)
-                    cur.execute(sql, param)
-                    result = cur.fetchone()
-
-                    if result is not None:
-                        category_token = result[0]
-                    else:
-                        category_token = None
-                    
-                    # category 테이블에 없는 category 일 때, token 생성해서 category 테이블에 추가
-                    if category_token == None:
-
-                        if category_name not in category_name_list:
-                            category_name_list.append(category_name)
-                            token = secrets.token_hex(16)
-                            category_dict[category_name] = token
-
-                        category_token=category_dict[category_name]
-                        
-
-                    first_frame_annotation_uuid = instance_data['first_frame_annotation_uuid']
-                    first_frame_annotation_token = first_frame_annotation_uuid.replace("-","")
-
-                    last_frame_annotation_uuid = instance_data['last_frame_annotation_uuid']
-                    last_frame_annotation_token = last_frame_annotation_uuid.replace("-","")
-
-                    num_annotations = instance_data['num_annotations']
-
-
-                    data.append((token, category_token, first_frame_annotation_token, last_frame_annotation_token, num_annotations))
-
-                query = "INSERT IGNORE INTO instance (token, category_token, first_frame_annotation_token, last_frame_annotation_token, num_annotations) VALUES (%s,%s,%s,%s,%s)"
-
-                cur.executemany(query, data)
-                conn.commit()
-
-        # category 테이블에 빠져있는 데이터 삽입
-        category_data = []
-        for category_name in category_name_list:
-            category_data.append((category_dict[category_name], category_name))
-
-        query = "INSERT IGNORE INTO category (token, name) VALUES (%s,%s)"
-
-        cur.executemany(query,category_data)
-        conn.commit()
-
-    cur.close()
-    conn.close()
-
-
-def instance_insert():
-
     # SFTP 및 MySQL 접속
     hook = SFTPHook(ssh_conn_id="eun_sftp")
     kakao_directory_list = hook.list_directory(kakao_remote_path)
@@ -1209,73 +1118,6 @@ def log_map_insert():
 
 def scenario_insert():
 
-    #sftp 접속 정보
-    hook = SFTPHook(ssh_conn_id = "eun_sftp")
-    kakao_directory_list = hook.list_directory(kakao_remote_path)
-
-    #mysql 접속 정보
-    mysql_hook = MySqlHook.get_hook(conn_id = 'aws_mysql')
-    conn = mysql_hook.get_conn()
-    cur = conn.cursor()
-
-    cur.execute("use av3d")
-
-    cur.execute("SELECT MAX(name) FROM scenario")
-    max_name = cur.fetchone()[0]
-
-    if max_name:
-        max_num = int(max_name.split("-")[1])
-    else:
-        max_num = 0
-
-    num = max_num + 1
-
-    with hook.get_conn() as sftp_client:
-        #TODO: 이전에는 카모 데이터셋이  하나였으니까 num을 1로 잡고 늘려가도 중복 없었음. 이렇게 처리하는 데이터셋이 하나였으니까. 그런데 이제는 이런 방식으로 처리해야하는 데이터셋이 여러개가 있다. 만약 다른 데이터셋을 이와 동일하게 처리하면 num이 1 인 레코드가 여러개가 나올 것이다.
-
-        #kakao scenario 테이블 데이터 삽입
-        #kakao는 여러개의 데이터셋이 다른 디렉토리에 개별로 저장되어있어서 디렉토리 돌아야하고, nuScenes 는 하나의 디렉토리에 여러개의 데이터셋이 한번에 들어있음
-        for dir_name in kakao_directory_list:
-
-            local_dir = prepare_local_dir(dir_name)
-            local_path = f"{local_dir}/scenario_dataset.json"
-            remote_path = f"{kakao_remote_path}/{dir_name}/meta/dataset.json"
-
-            sftp_client.get(remote_path, local_path)
-
-            with open(local_path) as f:
-                json_data = json.load(f)
-
-                # 1. scenario 테이블용
-                # nuScenes 처럼 scene 넘버로 name 변경
-                name = f"scene-{format(num,'04')}"
-                # scenario_names 엮어서 nuScenes 처럼 description 으로
-                description = ", ".join(json_data['scenario_names'])
-
-                # 2. scenarios_in_dataset 테이블용
-                dataset_uuid = json_data['uuid']
-                dataset_token = dataset_uuid.replace("-","")
-
-                # Insert into scenario
-                data = (name, description)
-                query = "INSERT IGNORE INTO scenario (name, description) VALUES (%s, %s)"
-                cur.execute(query, data)
-
-                # Insert into scenarios_in_dataset
-                data = (name, dataset_token)
-                query = "INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_name) VALUES (%s, %s)"
-                cur.execute(query, data)
-
-                conn.commit()
-
-                num += 1
-
-    cur.close()
-    conn.close()
-
-
-def scenario_insert():
-
     # SFTP 및 MySQL 접속
     hook = SFTPHook(ssh_conn_id="eun_sftp")
     kakao_directory_list = hook.list_directory(kakao_remote_path)
@@ -1355,7 +1197,7 @@ def scenario_insert():
     cur.execute("SELECT description, token FROM scenario")
     existing_scenarios = {desc: token for desc, token in cur.fetchall()}
 
-    # 다시 fusion3d로 전환
+    # 다시 avd로 전환
     cur.execute("USE av3d")
 
     # insert 대상 누적 리스트
@@ -1626,6 +1468,7 @@ def copy_to_adds():
     tables = [
         'annotation_type',
         'attribute',
+        'attribute_frame_annotation',
         'calibrated_sensor',
         'ego_pose',
         'instance',
