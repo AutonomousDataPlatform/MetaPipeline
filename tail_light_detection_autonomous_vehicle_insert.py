@@ -27,13 +27,11 @@ def prepare_local_dir(dir_name):
     os.makedirs(local_dir, exist_ok=True)
     return local_dir
 
+
 def cleanup_dirs():
     base_path = "tail_light_detection(autonomous_vehicle)"
     if os.path.exists(base_path):
-        for dir_name in os.listdir(base_path):
-            dir_path = os.path.join(base_path, dir_name)
-            if os.path.isdir(dir_path):
-                shutil.rmtree(dir_path)
+        shutil.rmtree(base_path)
 
 
 def annotation_type_insert():
@@ -1296,7 +1294,7 @@ def get_chunk_parameters(**kwargs):
             host = conn_info.host,
             user = conn_info.login,
             password = conn_info.password,
-            db = 'infra3d',
+            db = 'avtail',
             port = conn_info.port,
             cursorclass = pymysql.cursors.DictCursor
         )
@@ -1328,7 +1326,7 @@ def attribute_frame_annotation_insert(batch_number):
         host = conn_info.host,
         user = conn_info.login,
         password = conn_info.password,
-        db = 'infra3d',
+        db = 'avtail',
         port = conn_info.port,
         cursorclass = pymysql.cursors.DictCursor,
         autocommit = False
@@ -1367,6 +1365,7 @@ def copy_to_adds():
     tables = [
         'annotation_type',
         'attribute',
+        'attribute_frame_annotation',
         'calibrated_sensor',
         'ego_pose',
         'instance',
