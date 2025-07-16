@@ -213,9 +213,15 @@ def insert_dummy_log():
 
     cur.execute("USE ev6light")  # 작업 대상 DB
 
+    dataset_token = secrets.token_hex(16)
+    name = '[자율주행 차량 (EV6)] 신호등 인식 학습 데이터'
+
+    query = "INSERT INTO dataset (token, name) VALUES (%s, %s)"
+    cur.execute(query, (dataset_token, name))
+
     # log 더미 데이터
     log_token = secrets.token_hex(16)
-    cur.execute("INSERT IGNORE INTO log (token) VALUES (%s)", (log_token,))
+    cur.execute("INSERT IGNORE INTO log (token, dataset_token) VALUES (%s,%s)", (log_token, dataset_token))
 
     conn.commit()
 
@@ -256,7 +262,7 @@ def insert_dummy_sensor_and_calibrated_sensor():
 
 def insert_all_from_directory():
     """
-    dataset, scenario, instance, frame, frame_data, frame_annotation 통합 insert
+    scene, scenario, instance, frame, frame_data, frame_annotation 통합 insert
     """
 
     label_map = {
@@ -302,21 +308,20 @@ def insert_all_from_directory():
         if not os.path.isdir(scene_path):
             continue
 
-        # scene 디렉토리 단위로 dataset 생성
-        dataset_token = secrets.token_hex(16)
-        dataset_type = "kakao_mobility"
-        base_dir_path = f"/data/traffic_light_detection(EV6)/bbox/{scene_dir}"
+        # scene 디렉토리 단위로 scene 생성
+        scene_token = secrets.token_hex(16)
+        base_dir_path = f"[자율주행 차량 (EV6)] 신호등 인식 학습 데이터/bbox/{scene_dir}"
         num_frames = None
         first_frame_token = None
         last_frame_token = None
 
-        dataset_insert_query = """
-            INSERT IGNORE INTO dataset
-            (token, type, log_token, base_path, num_frames, first_frame_token, last_frame_token)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        scene_insert_query = """
+            INSERT IGNORE INTO scene
+            (token, log_token, base_path, num_frames, first_frame_token, last_frame_token)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """
-        cur.execute(dataset_insert_query, (
-            dataset_token, dataset_type, log_token,
+        cur.execute(scene_insert_query, (
+            scene_token, log_token,
             base_dir_path, num_frames, first_frame_token, last_frame_token
         ))
 
@@ -326,9 +331,9 @@ def insert_all_from_directory():
         scenario_insert_query = "INSERT IGNORE INTO scenario (token) VALUES (%s)"
         cur.execute(scenario_insert_query, (scenario_token,))
 
-        # scenario와 dataset 맵핑
-        scenarios_in_dataset_insert_query = "INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_token) VALUES (%s, %s)"
-        cur.execute(scenarios_in_dataset_insert_query, (dataset_token, scenario_token))
+        # scenario와 scene 맵핑
+        scenarios_in_scene_insert_query = "INSERT IGNORE INTO scenarios_in_scene (scene_token, scenario_token) VALUES (%s, %s)"
+        cur.execute(scenarios_in_scene_insert_query, (scene_token, scenario_token))
 
         frame_rows = []
         frame_data_rows = []
@@ -362,7 +367,7 @@ def insert_all_from_directory():
                     frame_token = secrets.token_hex(16)
                     frame_data_token = secrets.token_hex(16)
 
-                    frame_rows.append((frame_token, dataset_token))
+                    frame_rows.append((frame_token, scene_token))
 
                     frame_data_rows.append((
                         frame_data_token, frame_token, None, calibrated_sensor_token,
@@ -406,7 +411,7 @@ def insert_all_from_directory():
                     continue
 
         if frame_rows:
-            cur.executemany("INSERT IGNORE INTO frame (token, dataset_token) VALUES (%s, %s)", frame_rows)
+            cur.executemany("INSERT IGNORE INTO frame (token, scene_token) VALUES (%s, %s)", frame_rows)
 
         if frame_data_rows:
             cur.executemany("""
@@ -540,6 +545,7 @@ def copy_to_adds():
         'category',
         'lidarseg',
         'dataset',
+        'scene',
         'log',
         'map',
         'log_map',
@@ -547,7 +553,7 @@ def copy_to_adds():
         'frame_data',
         'frame',
         'scenario',
-        'scenarios_in_dataset',
+        'scenarios_in_scene',
         'sensor',
         'visibility'
     ]

@@ -371,7 +371,7 @@ def category_insert():
     conn.close()
 
 
-def dataset_insert():
+def scene_insert():
 
     #sftp 접속 정보
     hook = SFTPHook(ssh_conn_id = "eun_sftp")
@@ -399,13 +399,11 @@ def dataset_insert():
 
                 uuid = json_data['uuid']
                 token = uuid.replace("-","")
-                
-                type = 'kakao_mobility'
 
                 log_uuid = json_data['log_uuid']
                 log_token = log_uuid.replace("-","")
 
-                base_path = f"3D_object_detection_tracking(infra_edge)/{json_data['name']}/sensor/"
+                base_path = f"[인프라 엣지] 3D 동적객체 검출추적 학습 데이터 (2025년)/{json_data['name']}/"
 
                 num_frames = json_data['num_frames']
 
@@ -415,9 +413,9 @@ def dataset_insert():
                 last_frame_uuid = json_data['last_frame_uuid']
                 last_frame_token = last_frame_uuid.replace("-","")
 
-                data = (token, type, log_token, base_path, num_frames, first_frame_token, last_frame_token)
+                data = (token, log_token, base_path, num_frames, first_frame_token, last_frame_token)
 
-                query = "INSERT IGNORE INTO dataset (token, type, log_token, base_path, num_frames, first_frame_token, last_frame_token) VALUES (%s,%s,%s,%s,%s,%s,%s)"
+                query = "INSERT IGNORE INTO scene (token, log_token, base_path, num_frames, first_frame_token, last_frame_token) VALUES (%s,%s,%s,%s,%s,%s)"
 
                 cur.execute(query, data)
                 conn.commit()
@@ -834,7 +832,7 @@ def frame_insert():
                     timestamp = frame_data['timestamp']
                     
                     dataset_uuid = frame_data['dataset_uuid']
-                    dataset_token = dataset_uuid.replace("-","")
+                    scene_token = dataset_uuid.replace("-","")
 
                     prev = frame_data['prev']
                     if prev != None:
@@ -845,9 +843,9 @@ def frame_insert():
                         next = next.replace("-","")
 
 
-                    data.append((token, timestamp, dataset_token, prev, next))
+                    data.append((token, timestamp, scene_token, prev, next))
                     
-                query = "INSERT IGNORE INTO frame (token, timestamp, dataset_token, prev, next) VALUES (%s,%s,%s,%s,%s)"
+                query = "INSERT IGNORE INTO frame (token, timestamp, scene_token, prev, next) VALUES (%s,%s,%s,%s,%s)"
                     
                 cur.executemany(query,data)
                 conn.commit()
@@ -957,6 +955,12 @@ def log_insert():
 
     cur.execute("use infra3d")
 
+    dataset_token = secrets.token_hex(16)
+    name = '[인프라 엣지] 3D 동적객체 검출/추적 데이터 (2025년)'
+
+    query = "INSERT INTO dataset (token, name) VALUES (%s, %s)"
+    cur.execute(query, (dataset_token, name))
+
     with hook.get_conn() as sftp_client:
 
         for dir_name in kakao_directory_list:
@@ -991,9 +995,9 @@ def log_insert():
                     device_wlh = json.dumps(device_wlh)
     
 
-                data = (token, device, date_captured, location, driving_distance, device_wlh)
+                data = (token, dataset_token, device, date_captured, location, driving_distance, device_wlh)
 
-                query = "INSERT IGNORE INTO log (token, device, date_captured, location, driving_distance, device_wlh) VALUES (%s,%s,%s,%s,%s,%s)"
+                query = "INSERT IGNORE INTO log (token, dataset_token, device, date_captured, location, driving_distance, device_wlh) VALUES (%s,%s,%s,%s,%s,%s,%s)"
 
                 cur.execute(query, data)
                 conn.commit()
@@ -1075,7 +1079,7 @@ def scenario_insert():
 
     # insert 대상 누적 리스트
     new_scenario_data = []  # adds DB에 새로 insert할 scenario들
-    scenarios_in_dataset_data = []
+    scenarios_in_scene_data = []
 
     # 중복 방지를 위한 local 캐시
     local_description_to_token = existing_scenarios.copy()
@@ -1100,7 +1104,7 @@ def scenario_insert():
 
                 # dataset_token 준비
                 dataset_uuid = json_data.get("uuid", "")
-                dataset_token = dataset_uuid.replace("-", "")
+                scene_token = dataset_uuid.replace("-", "")
 
                 # token 결정: 기존에 있는지 확인
                 if description in local_description_to_token:
@@ -1110,8 +1114,8 @@ def scenario_insert():
                     local_description_to_token[description] = scenario_token
                     new_scenario_data.append((scenario_token, description))
 
-                # 연결 테이블(scenarios_in_dataset)용 데이터
-                scenarios_in_dataset_data.append((dataset_token, scenario_token))
+                # 연결 테이블(scenarios_in_scene)용 데이터
+                scenarios_in_scene_data.append((scene_token, scenario_token))
 
             # **방금 쓴 파일·디렉터리 즉시 삭제**
             os.remove(local_path)
@@ -1125,11 +1129,11 @@ def scenario_insert():
         )
 
     # infra3d에 연결 정보 추가
-    if scenarios_in_dataset_data:
+    if scenarios_in_scene_data:
         cur.execute("USE infra3d")
         cur.executemany(
-            "INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_token) VALUES (%s, %s)",
-            scenarios_in_dataset_data
+            "INSERT IGNORE INTO scenarios_in_scene (scene_token, scenario_token) VALUES (%s, %s)",
+            scenarios_in_scene_data
         )
 
     conn.commit()
@@ -1137,7 +1141,7 @@ def scenario_insert():
     conn.close()
 
     print(f"[INFO] 새로 추가된 scenario ::::: {new_scenario_data}")
-    print(f"[INFO] scenarios_in_dataset ::::: {scenarios_in_dataset_data}")
+    print(f"[INFO] scenarios_in_scene ::::: {scenarios_in_scene_data}")
 
 
 def sensor_insert():
@@ -1350,6 +1354,7 @@ def copy_to_adds():
         'category',
         'lidarseg',
         'dataset',
+        'scene',
         'log',
         'map',
         'log_map',
@@ -1357,7 +1362,7 @@ def copy_to_adds():
         'frame_data',
         'frame',
         'scenario',
-        'scenarios_in_dataset',
+        'scenarios_in_scene',
         'sensor',
         'visibility'
     ]
@@ -1385,7 +1390,7 @@ with DAG('3D_object_detection_tracking_infra_edge_insert',
     calibrated_sensor_insert_task = PythonOperator(task_id = 'calibrated_sensor_insert', python_callable = calibrated_sensor_insert)
     category_insert_task = PythonOperator(task_id = 'category_insert', python_callable = category_insert)
     sensor_insert_task = PythonOperator(task_id = 'sensor_insert', python_callable = sensor_insert)
-    dataset_insert_task = PythonOperator(task_id = 'dataset_insert', python_callable = dataset_insert)
+    scene_insert_task = PythonOperator(task_id = 'scene_insert', python_callable = scene_insert)
     ego_pose_insert_task = PythonOperator(task_id = 'ego_pose_insert', python_callable = ego_pose_insert)
     frame_annotation_insert_task = PythonOperator(task_id = 'frame_annotation_insert', python_callable = frame_annotation_insert)
     frame_data_insert_task = PythonOperator(task_id = 'frame_data_insert', python_callable = frame_data_insert)
@@ -1403,7 +1408,7 @@ with DAG('3D_object_detection_tracking_infra_edge_insert',
     copy_to_adds_task = PythonOperator(task_id = 'copy_to_adds', python_callable = copy_to_adds)
 
 
-tasks = [annotation_type_insert_task, category_insert_task, dataset_insert_task, ego_pose_insert_task, frame_insert_task, log_insert_task, sensor_insert_task, visibility_insert_task]
+tasks = [annotation_type_insert_task, category_insert_task, scene_insert_task, ego_pose_insert_task, frame_insert_task, log_insert_task, sensor_insert_task, visibility_insert_task]
 
 # insert하려면 선행되어야하는 태스크들이 있어 올바른 순서가 필요함.
 tasks >> attribute_insert_task >> log_map_insert_task >> scenario_insert_task >> calibrated_sensor_insert_task >> frame_data_insert_task >> instance_insert_task >> frame_annotation_insert_task >> chunk_params >> attribute_frame_annotation_insert_task >> cleanup_task >> copy_to_adds_task

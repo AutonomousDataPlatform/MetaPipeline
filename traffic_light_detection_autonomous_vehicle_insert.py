@@ -217,9 +217,9 @@ def category_insert(**context):
     context['ti'].xcom_push(key = 'category_id_to_token', value = category_id_to_token)
 
 
-# dataset insert할 때 연결용 frame 더미 데이터도 하나 생성. token, dataset_token 만 존재하는 frame 데이터 만들어서 frame 테이블에 insert. (dataset_token으로 맵핑)
-# dataset insert할 때 연결용 scenario 더미 데이터도 하나 생성. token만 존재하는 scenario 데이터 만듦. scenarios_in_dataset 테이블에 insert해서 맵핑
-def log_and_dataset_insert():
+# scene insert할 때 연결용 frame 더미 데이터도 하나 생성. token, scene_token 만 존재하는 frame 데이터 만들어서 frame 테이블에 insert. (scene_token으로 맵핑)
+# scene insert할 때 연결용 scenario 더미 데이터도 하나 생성. token만 존재하는 scenario 데이터 만듦. scenarios_in_scene 테이블에 insert해서 맵핑
+def log_and_scene_insert():
 
     # SFTP, MySQL 연결
     hook = SFTPHook(ssh_conn_id = "eun_sftp")
@@ -227,6 +227,12 @@ def log_and_dataset_insert():
     conn = mysql_hook.get_conn()
     cur = conn.cursor()
     cur.execute("USE avlight")
+
+    dataset_token = secrets.token_hex(16)
+    name = '[자율주행 차량] 신호등 인식 학습 데이터'
+
+    query = "INSERT INTO dataset (token, name) VALUES (%s, %s)"
+    cur.execute(query, (dataset_token, name))
 
     log_token_dict = {}
 
@@ -252,26 +258,25 @@ def log_and_dataset_insert():
         log_token = secrets.token_hex(16)
         dt_obj = datetime.strptime(info["date_created"], "%Y/%m/%d")
         date_captured = dt_obj.strftime("%Y-%m-%d")
-        cur.execute("INSERT IGNORE INTO log (token, date_captured) VALUES (%s, %s)", (log_token, date_captured))
+        cur.execute("INSERT IGNORE INTO log (token, dataset_token, date_captured) VALUES (%s, %s, %s)", (log_token, dataset_token, date_captured))
 
-        # dataset 테이블 insert
-        dataset_token = secrets.token_hex(16)
-        dataset_type = "kakao_mobility"
-        base_path = f"traffic_light_detection(autonomous_vehicle)/{dir_name}"
+        # scene 테이블 insert
+        scene_token = secrets.token_hex(16)
+        base_path = f"[자율주행 차량]신호등 인식 학습 데이터/{dir_name}"
         num_frames = None
         first_frame_token = None
         last_frame_token = None
         cur.execute("""
-            INSERT IGNORE INTO dataset (token, type, log_token, base_path, num_frames, first_frame_token, last_frame_token)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (dataset_token, dataset_type, log_token, base_path, num_frames, first_frame_token, last_frame_token))
+            INSERT IGNORE INTO scene (token, log_token, base_path, num_frames, first_frame_token, last_frame_token)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (scene_token, log_token, base_path, num_frames, first_frame_token, last_frame_token))
 
         # scenario 테이블 insert
         scenario_token = secrets.token_hex(16)
         cur.execute("INSERT IGNORE INTO scenario (token) VALUES (%s)", (scenario_token,))
 
-        # scenarios_in_dataset 테이블 insert
-        cur.execute("INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_token) VALUES (%s, %s)", (dataset_token, scenario_token))
+        # scenarios_in_scene 테이블 insert
+        cur.execute("INSERT IGNORE INTO scenarios_in_scene (scene_token, scenario_token) VALUES (%s, %s)", (scene_token, scenario_token))
 
         conn.commit()
         log_token_dict[dir_name] = log_token
@@ -337,9 +342,9 @@ def insert_all_from_instances_json(**context):
     # 2. 작업 대상 DB로 전환
     cur.execute("USE avlight")
 
-    # dataset token 조회
-    cur.execute("SELECT token FROM dataset LIMIT 1")
-    dataset_token = cur.fetchone()[0]
+    # scene token 조회
+    cur.execute("SELECT token FROM scene LIMIT 1")
+    scene_token = cur.fetchone()[0]
 
     # calibrated_sensor token 조회
     cur.execute("SELECT token FROM calibrated_sensor")
@@ -384,7 +389,7 @@ def insert_all_from_instances_json(**context):
 
             image_id_to_token[image_id] = (frame_token, frame_data_token)
 
-            frame_rows.append((frame_token, dataset_token))
+            frame_rows.append((frame_token, scene_token))
             frame_data_rows.append((frame_data_token, frame_token, calibrated_sensor_token, height, width, file_name, file_format))
 
         # 2. instance & frame_annotation 처리
@@ -450,7 +455,7 @@ def insert_all_from_instances_json(**context):
 
     # frame INSERT
     cur.executemany(
-        "INSERT IGNORE INTO frame (token, dataset_token) VALUES (%s, %s)",
+        "INSERT IGNORE INTO frame (token, scene_token) VALUES (%s, %s)",
         frame_rows
     )
 
@@ -569,6 +574,7 @@ def copy_to_adds():
         'category',
         'lidarseg',
         'dataset',
+        'scene',
         'log',
         'map',
         'log_map',
@@ -576,7 +582,7 @@ def copy_to_adds():
         'frame_data',
         'frame',
         'scenario',
-        'scenarios_in_dataset',
+        'scenarios_in_scene',
         'sensor',
         'visibility'
     ]
@@ -603,7 +609,7 @@ with DAG('traffic_light_detection_autonomous_vehicle_insert',
     attribute_insert_task = PythonOperator(task_id = 'attribute_insert', python_callable = attribute_insert)
     category_insert_task = PythonOperator(task_id = 'category_insert', python_callable = category_insert)
     insert_dummy_sensor_and_calibrated_sensor_task = PythonOperator(task_id = 'insert_dummy_sensor_and_calibrated_sensor', python_callable = insert_dummy_sensor_and_calibrated_sensor)
-    log_and_dataset_insert_task = PythonOperator(task_id = 'log_and_dataset_insert', python_callable = log_and_dataset_insert)
+    log_and_scene_insert_task = PythonOperator(task_id = 'log_and_dataset_insert', python_callable = log_and_scene_insert)
     insert_all_from_instances_json_task = PythonOperator(task_id = 'insert_all_from_instances_json', python_callable = insert_all_from_instances_json)
 
     chunk_params = get_chunk_parameters()
@@ -613,6 +619,6 @@ with DAG('traffic_light_detection_autonomous_vehicle_insert',
     copy_to_adds_task = PythonOperator(task_id = 'copy_to_adds', python_callable = copy_to_adds)
     #cleanup_task = PythonOperator(task_id = 'cleanup_all_local_dirs',python_callable = cleanup_all_local_dirs)
 
-attribute_insert_task >> category_insert_task >> [insert_dummy_sensor_and_calibrated_sensor_task, log_and_dataset_insert_task] >> insert_all_from_instances_json_task >> chunk_params >> attribute_frame_annotation_insert_task >> copy_to_adds_task
+attribute_insert_task >> category_insert_task >> [insert_dummy_sensor_and_calibrated_sensor_task, log_and_scene_insert_task] >> insert_all_from_instances_json_task >> chunk_params >> attribute_frame_annotation_insert_task >> copy_to_adds_task
 
 # download_task >> attribute_insert_task >> category_insert_task >> [log_and_dataset_insert_task, insert_all_from_instances_json_task] >> copy_to_adds_task >> cleanup_task

@@ -8,6 +8,7 @@ import json, ijson
 import pymysql
 import os
 from airflow.decorators import task
+import secrets
 
 
 default_args = {
@@ -323,13 +324,13 @@ def lidarseg_insert():
     os.remove(local_path)
 
 
-def dataset_insert():
+def scene_insert():
     #sftp 접속 정보
     hook = SFTPHook(ssh_conn_id = "eun_sftp")
 
     remote_path = '/data/nuScenes/v1.0-trainval'
     #local 에 저장할 때 파일 이름
-    local_path = 'nuScenes_dataset_scene.json'
+    local_path = 'nuScenes_scene.json'
 
     #mysql 접속 정보
     mysql_hook = MySqlHook.get_hook(conn_id = 'aws_mysql')
@@ -350,17 +351,16 @@ def dataset_insert():
 
             for scene_data in json_data:
                 token = scene_data['token']
-                type = 'nuScenes'
                 log_token = scene_data['log_token']
                 base_path = None
                 num_frames = scene_data['nbr_samples']
                 first_frame_token = scene_data['first_sample_token']
                 last_frame_token = scene_data['last_sample_token']
                 
-                data.append((token, type, log_token, base_path, num_frames, first_frame_token,last_frame_token))
+                data.append((token, log_token, base_path, num_frames, first_frame_token,last_frame_token))
 
 
-            query = "INSERT IGNORE INTO dataset (token, type, log_token, base_path, num_frames, first_frame_token,last_frame_token) VALUES (%s,%s,%s,%s,%s,%s,%s)"
+            query = "INSERT IGNORE INTO scene (token, log_token, base_path, num_frames, first_frame_token,last_frame_token) VALUES (%s,%s,%s,%s,%s,%s)"
 
             cur.executemany(query,data)
             conn.commit()
@@ -385,6 +385,12 @@ def log_insert():
 
     cur.execute("use nuScenes")
 
+    dataset_token = secrets.token_hex(16)
+    name = 'nuScenes'
+
+    query = "INSERT INTO dataset (token, name) VALUES (%s, %s)"
+    cur.execute(query, (dataset_token, name))
+
     with hook.get_conn() as sftp_client:
 
         file_path = remote_path + '/log.json'
@@ -402,9 +408,9 @@ def log_insert():
                 logfile = log_data['logfile']
                 
                 
-                data.append((token, device, date_captured, location, logfile))
+                data.append((token, dataset_token, device, date_captured, location, logfile))
 
-            query = "INSERT IGNORE INTO log (token, device, date_captured, location, logfile) VALUES (%s,%s,%s,%s,%s)"
+            query = "INSERT IGNORE INTO log (token, dataset_token, device, date_captured, location, logfile) VALUES (%s,%s,%s,%s,%s,%s)"
 
             cur.executemany(query,data)
             conn.commit()
@@ -677,11 +683,11 @@ def frame_insert():
                 if next == "":
                     next = None
                 
-                dataset_token = sample_data['scene_token']
+                scene_token = sample_data['scene_token']
                 
-                data.append((token, timestamp, dataset_token, prev, next))
+                data.append((token, timestamp, scene_token, prev, next))
 
-            query = "INSERT IGNORE INTO frame (token, timestamp, dataset_token, prev, next) VALUES (%s,%s,%s,%s,%s)"
+            query = "INSERT IGNORE INTO frame (token, timestamp, scene_token, prev, next) VALUES (%s,%s,%s,%s,%s)"
 
             cur.executemany(query,data)
             conn.commit()
@@ -715,61 +721,26 @@ def scenario_insert():
         with open(local_path) as f:
             json_data = json.load(f)
 
-            data = []
+            scenario_data = []
+            scenarios_in_scene_data = []
 
             for scene_data in json_data:
-                token = scene_data['token']
+                scenario_token = secrets.token_hex(16)
                 description = scene_data['description']
 
-                data.append((token, description))
+                scenario_data.append((scenario_token, description))
+
+                scene_token = scene_data['token']
+                scenarios_in_scene_data.append((scene_token, scenario_token))
 
             query = "INSERT IGNORE INTO scenario (token, description) VALUES (%s, %s)"
 
-            cur.executemany(query,data)
+            cur.executemany(query, scenario_data)
             conn.commit()
-    
 
-    cur.close()
-    conn.close()
-    os.remove(local_path)
+            query = "INSERT IGNORE INTO scenarios_in_scene (scene_token, scenario_token) VALUES (%s, %s)"
 
-
-def scenarios_in_dataset_insert():
-    #sftp 접속 정보
-    hook = SFTPHook(ssh_conn_id = "eun_sftp")
-
-    remote_path = '/data/nuScenes/v1.0-trainval'
-    #local 에 저장할 때 파일 이름
-    local_path = 'nuScenes_scenarios_in_dataset.json'
-
-    #mysql 접속 정보
-    mysql_hook = MySqlHook.get_hook(conn_id = 'aws_mysql')
-    conn = mysql_hook.get_conn()
-    cur = conn.cursor()
-
-    cur.execute("use nuScenes")
-
-    with hook.get_conn() as sftp_client:
-
-        file_path = remote_path + '/scene.json'
-        sftp_client.get(file_path, local_path)
-
-        with open(local_path) as f:
-            json_data = json.load(f)
-
-            data = []
-
-            for scene_data in json_data:
-
-                dataset_token = scene_data['token']
-                scene_token = scene_data['token']
-
-                data.append((dataset_token, scene_token))
-
-
-            query = "INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_token) VALUES (%s,%s)"
-
-            cur.executemany(query,data)
+            cur.executemany(query, scenarios_in_scene_data)
             conn.commit()
     
 
@@ -951,6 +922,7 @@ def copy_to_adds():
         'category',
         'lidarseg',
         'dataset',
+        'scene',
         'log',
         'map',
         'log_map',
@@ -958,7 +930,7 @@ def copy_to_adds():
         'frame_data',
         'frame',
         'scenario',
-        'scenarios_in_dataset',
+        'scenarios_in_scene',
         'sensor',
         'visibility'
     ]
@@ -988,7 +960,7 @@ with DAG('nuScenes_insert',
     instance_insert_task = PythonOperator(task_id = 'instance_insert', python_callable = instance_insert)
     category_insert_task = PythonOperator(task_id = 'category_insert', python_callable = category_insert)
     lidarseg_insert_task = PythonOperator(task_id = 'lidarseg_insert', python_callable = lidarseg_insert)
-    dataset_insert_task = PythonOperator(task_id = 'dataset_insert', python_callable = dataset_insert)
+    scene_insert_task = PythonOperator(task_id = 'scene_insert', python_callable = scene_insert)
     log_insert_task = PythonOperator(task_id = 'log_insert', python_callable = log_insert)
     map_insert_insert = PythonOperator(task_id = 'map_insert', python_callable = map_insert)
     log_map_insert_insert = PythonOperator(task_id = 'log_map_insert', python_callable = log_map_insert)
@@ -996,7 +968,6 @@ with DAG('nuScenes_insert',
     frame_data_insert_task = PythonOperator(task_id = 'sample_data_insert', python_callable = frame_data_insert)
     frame_insert_task = PythonOperator(task_id = 'frame_insert', python_callable = frame_insert)
     scenario_insert_task = PythonOperator(task_id = 'scenario_insert', python_callable = scenario_insert)
-    scenarios_in_dataset_insert_task = PythonOperator(task_id = 'scenarios_in_dataset_insert', python_callable = scenarios_in_dataset_insert)
     sensor_insert_task = PythonOperator(task_id = 'sensor_insert', python_callable = sensor_insert)
     visibility_insert_task = PythonOperator(task_id = 'visibility_insert', python_callable = visibility_insert)
     copy_to_adds_task = PythonOperator(task_id = 'copy_to_adds', python_callable = copy_to_adds)
@@ -1006,4 +977,4 @@ with DAG('nuScenes_insert',
     attribute_frame_annotation_insert_task = PythonOperator.partial(task_id = 'process_batch', python_callable = attribute_frame_annotation_insert).expand(op_kwargs = chunk_params)
 
 
-[annotation_type_insert_task, attribute_insert_task, calibrated_sensor_insert_task, instance_insert_task, category_insert_task, lidarseg_insert_task, dataset_insert_task, log_insert_task, map_insert_insert, log_map_insert_insert, frame_insert_task, scenario_insert_task, scenarios_in_dataset_insert_task, sensor_insert_task, visibility_insert_task] >> ego_pose_insert_task >> frame_data_insert_task >> frame_annotation_insert_task >> chunk_params >> attribute_frame_annotation_insert_task >> copy_to_adds_task
+[annotation_type_insert_task, attribute_insert_task, calibrated_sensor_insert_task, instance_insert_task, category_insert_task, lidarseg_insert_task, scene_insert_task, log_insert_task, map_insert_insert, log_map_insert_insert, frame_insert_task, scenario_insert_task, sensor_insert_task, visibility_insert_task] >> ego_pose_insert_task >> frame_data_insert_task >> frame_annotation_insert_task >> chunk_params >> attribute_frame_annotation_insert_task >> copy_to_adds_task
