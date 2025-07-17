@@ -413,7 +413,7 @@ def scene_insert():
 
                 data = (token, log_token, base_path, num_frames, first_frame_token, last_frame_token)
 
-                query = "INSERT IGNORE INTO dataset (token, log_token, base_path, num_frames, first_frame_token, last_frame_token) VALUES (%s,%s,%s,%s,%s,%s)"
+                query = "INSERT IGNORE INTO scene (token, log_token, base_path, num_frames, first_frame_token, last_frame_token) VALUES (%s,%s,%s,%s,%s,%s)"
 
                 cur.execute(query, data)
                 conn.commit()
