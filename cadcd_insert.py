@@ -256,6 +256,7 @@ def category_insert():
     conn.close()
 
 
+# NOTE: existing_names adds DB에서 조회? OR cadcd에서 조회?
 def attribute_insert():
     # SFTP 연결
     hook = SFTPHook(ssh_conn_id="eun_sftp")
@@ -532,7 +533,7 @@ def scenario_insert():
 
 def integral_insert(ti = None):
     """
-    calibrated_sensor, dataset, log, frame
+    calibrated_sensor, scene (구 dataset), dataset (어떤 데이터셋인지 정보), log, frame
     calibrated_sensor 테이블에 카메라 및 LiDAR 캘리브레이션 정보 insert
     sensor_token은 XCom으로 전달된 sensor_insert 결과 사용
     """
@@ -551,6 +552,13 @@ def integral_insert(ti = None):
     conn = mysql_hook.get_conn()
     cur = conn.cursor()
     cur.execute("USE cadcd")
+
+    # === dataset 테이블 insert
+    dataset_token = secrets.token_hex(16)
+    name = 'CADC'
+
+    query = "INSERT INTO dataset (token, name) VALUES (%s, %s)"
+    cur.execute(query, (dataset_token, name))
 
     # === attribute cadcd 표현 방식 rename map
     rename_map_cadcd = {
@@ -789,9 +797,9 @@ def integral_insert(ti = None):
                 except Exception as e:
                     print(f"[에러] calibrated_sensor insert 실패: {date_dir} / {e}")
             
-            # === 각 date_dir 내 씬 디렉토리별 frame + log + dataset 처리 ===
+            # === 각 date_dir 내 씬 디렉토리별 frame + log + scene 처리 ===
             frame_rows = []
-            dataset_rows = []
+            scene_rows = []
             log_rows = []
             ego_pose_rows = []
 
@@ -844,9 +852,9 @@ def integral_insert(ti = None):
                 if len(timestamps) < frame_count:
                     print(f"[경고] timestamps 수 ({len(timestamps)}) < cuboids 수 ({frame_count}) in {scene_dir}, 프레임 일부 누락될 수 있음")
 
-                # === log_token, dataset_token, frame_token 생성 ===
+                # === log_token, scene_token, frame_token 생성 ===
                 log_token = secrets.token_hex(16)
-                dataset_token = secrets.token_hex(16)
+                scene_token = secrets.token_hex(16)
                 tokens = [secrets.token_hex(16) for _ in range(frame_count)]
 
                 # === log 테이블용 데이터 추가 ===
@@ -859,7 +867,7 @@ def integral_insert(ti = None):
 
                 default_device = "Autonomoose"
                 default_location = "canada-waterloo"
-                log_rows.append((log_token, default_device, date_captured, default_location))
+                log_rows.append((log_token, dataset_token, default_device, date_captured, default_location))
 
                 # === frame 데이터 ===
                 for i in range(frame_count):
@@ -883,21 +891,19 @@ def integral_insert(ti = None):
                     frame_rows.append((
                         cur_token,
                         unix_ts,
-                        dataset_token,  # 연결된 dataset_token 사용
+                        scene_token,  # 연결된 scene_token 사용
                         prev_token,
                         next_token
                     ))
 
-                # === dataset 데이터 ===
-                type = "CADC"
+                # === scene 데이터 ===
                 first_frame_token = tokens[0]
                 last_frame_token = tokens[-1]
-                base_path = f"/data/cadcd/{date_dir}/{scene_dir}"
+                base_path = f"cadcd/{date_dir}/{scene_dir}"
                 num_frames = frame_count
 
-                dataset_rows.append((
-                    dataset_token,
-                    type,
+                scene_rows.append((
+                    scene_token,
                     log_token,
                     base_path,
                     num_frames,
@@ -1129,8 +1135,8 @@ def integral_insert(ti = None):
                                 "num_lidar_pts": num_lidar_pts,
                                 "attribute_tokens": json.dumps(attr_tokens) if attr_tokens else None,
                                 "sort_key": frame_index,
-                                "label": label,                 # ✅ 추가
-                                "attributes": attributes        # ✅ 추가
+                                "label": label,                 # 추가
+                                "attributes": attributes        # 추가
                             })
 
                         except Exception as e:
@@ -1158,7 +1164,7 @@ def integral_insert(ti = None):
                         next_token
                     ))
 
-                # ✅ instance 정보 추출
+                # instance 정보 추출
                 ann0 = annotations[0]
                 label = ann0["label"]
                 attributes = ann0["attributes"]
@@ -1223,7 +1229,7 @@ def integral_insert(ti = None):
             if frame_rows:
                 query = """
                     INSERT IGNORE INTO frame (
-                        token, timestamp, dataset_token, prev, next
+                        token, timestamp, scene_token, prev, next
                     ) VALUES (%s, %s, %s, %s, %s)
                 """
                 try:
@@ -1236,8 +1242,8 @@ def integral_insert(ti = None):
             if log_rows:
                 query = """
                     INSERT IGNORE INTO log (
-                        token, device, date_captured, location
-                    ) VALUES (%s, %s, %s, %s)
+                        token, dataset_token, device, date_captured, location
+                    ) VALUES (%s, %s, %s, %s, %s)
                 """
                 try:
                     cur.executemany(query, log_rows)
@@ -1245,16 +1251,16 @@ def integral_insert(ti = None):
                 except Exception as e:
                     print(f"[에러] log insert 실패: {date_dir} / {e}")
 
-            # dataset 테이블 insert
-            if dataset_rows:
+            # scene 테이블 insert
+            if scene_rows:
                 query = """
-                    INSERT IGNORE INTO dataset (
-                        token, type, log_token, base_path, num_frames, first_frame_token, last_frame_token
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT IGNORE INTO scene (
+                        token, log_token, base_path, num_frames, first_frame_token, last_frame_token
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
                 """
                 try:
-                    cur.executemany(query, dataset_rows)
-                    print(f"[완료] dataset 테이블에 {len(dataset_rows)}건 insert 완료: {date_dir}")
+                    cur.executemany(query, scene_rows)
+                    print(f"[완료] dataset 테이블에 {len(scene_rows)}건 insert 완료: {date_dir}")
                 except Exception as e:
                     print(f"[에러] dataset insert 실패: {date_dir} / {e}")
             
@@ -1276,9 +1282,9 @@ def integral_insert(ti = None):
     conn.close()
 
 
-def scenarios_in_dataset_insert():
+def scenarios_in_scene_insert():
     """
-    모든 dataset에 대해 scenarios_in_dataset 테이블에 dataset_token, scenario_token 삽입
+    모든 scene에 대해 scenarios_in_scene 테이블에 scene_token, scenario_token 삽입
     scenario 테이블에는 단 하나의 레코드가 있다고 가정
     """
     # MySQL 연결
@@ -1297,26 +1303,26 @@ def scenarios_in_dataset_insert():
     scenario_token = result[0]
     print(f"[확인] scenario_token: {scenario_token}")
 
-    # dataset 테이블에서 모든 token 가져오기
-    cur.execute("SELECT token FROM dataset")
-    dataset_tokens = [row[0] for row in cur.fetchall()]
+    # scene 테이블에서 모든 token 가져오기
+    cur.execute("SELECT token FROM scene")
+    scene_tokens = [row[0] for row in cur.fetchall()]
 
-    if not dataset_tokens:
-        print("[스킵] dataset 테이블에 레코드가 없습니다.")
+    if not scene_tokens:
+        print("[스킵] scene 테이블에 레코드가 없습니다.")
         return
 
     # 삽입할 데이터 구성
-    insert_data = [(dataset_token, scenario_token) for dataset_token in dataset_tokens]
+    insert_data = [(scene_token, scenario_token) for scene_token in scene_tokens]
 
     try:
         cur.executemany(
-            "INSERT IGNORE INTO scenarios_in_dataset (dataset_token, scenario_token) VALUES (%s, %s)",
+            "INSERT IGNORE INTO scenarios_in_scene (scene_token, scenario_token) VALUES (%s, %s)",
             insert_data
         )
         conn.commit()
-        print(f"[완료] scenarios_in_dataset 테이블에 {len(insert_data)}건 insert 완료")
+        print(f"[완료] scenarios_in_scene 테이블에 {len(insert_data)}건 insert 완료")
     except Exception as e:
-        print(f"[에러] scenarios_in_dataset insert 실패: {e}")
+        print(f"[에러] scenarios_in_scene insert 실패: {e}")
 
     cur.close()
     conn.close()
@@ -1409,6 +1415,7 @@ def copy_to_adds():
         'instance',
         'lidarseg',
         'dataset',
+        'scene',
         'log',
         'map',
         'log_map',
@@ -1416,7 +1423,7 @@ def copy_to_adds():
         'frame_data',
         'frame',
         'scenario',
-        'scenarios_in_dataset',
+        'scenarios_in_scene',
         'sensor',
         'visibility'
     ]
@@ -1445,7 +1452,7 @@ with DAG('cadcd_insert',
     sensor_insert_task = PythonOperator(task_id = 'sensor_insert', python_callable = sensor_insert)
     integral_insert_task = PythonOperator(task_id = 'integral_insert', python_callable = integral_insert)
     scenario_insert_task = PythonOperator(task_id = 'scenario_insert', python_callable = scenario_insert)
-    scenarios_in_dataset_insert_task = PythonOperator(task_id = 'scenarios_in_dataset', python_callable = scenarios_in_dataset_insert)
+    scenarios_in_scene_insert_task = PythonOperator(task_id = 'scenarios_in_scene_insert', python_callable = scenarios_in_scene_insert)
     
     chunk_params = get_chunk_parameters()
 
@@ -1456,4 +1463,4 @@ with DAG('cadcd_insert',
 
 
 # Define task dependencies # download_all_ann_files_task >> download_all_novatel_files_task >> 
-[category_insert_task, attribute_insert_task, sensor_insert_task] >> integral_insert_task >> scenario_insert_task >> scenarios_in_dataset_insert_task >> chunk_params >> attribute_frame_annotation_insert_task >> copy_to_adds_task
+[category_insert_task, attribute_insert_task, sensor_insert_task] >> integral_insert_task >> scenario_insert_task >> scenarios_in_scene_insert_task >> chunk_params >> attribute_frame_annotation_insert_task >> copy_to_adds_task 
