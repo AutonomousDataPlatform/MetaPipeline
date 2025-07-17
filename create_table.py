@@ -22,7 +22,7 @@ def create_table():
         host = conn_info.host,
         user = conn_info.login,
         password = conn_info.password,
-        db = 'av3d',
+        db = 'cadcd',
         port = conn_info.port,
         client_flag = CLIENT.MULTI_STATEMENTS,
         autocommit = False
