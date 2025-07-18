@@ -82,6 +82,14 @@ def lambda_handler(event, context):
             MultipartUpload={'Parts': parts}
         )
 
+        # batch 디렉토리 삭제
+        delete_objects = [{'Key': obj['Key']} for obj in response['Contents']]
+        if delete_objects:
+            s3_client.delete_objects(
+                Bucket=bucket_name,
+                Delete={'Objects': delete_objects}
+            )
+
         return {
             'statusCode': 200,
             'body': json.dumps({

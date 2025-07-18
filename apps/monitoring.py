@@ -10,7 +10,7 @@ def lambda_handler(event, context):
     # 본문이 JSON 형식으로 전달되었으므로 JSON으로 파싱
     data = json.loads(body)
     
-    execution_arn = data.get('execution_arn')
+    execution_arn = data.get('executionArn')
 
     try:
         # 실행 상태 확인

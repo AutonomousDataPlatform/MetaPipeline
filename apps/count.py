@@ -2,25 +2,41 @@ import pymysql
 import pymysql.cursors
 import dbinfo
 
-connection = pymysql.connect(host = dbinfo.db_host, port = 23306, user = dbinfo.db_username, passwd = dbinfo.db_password, db = dbinfo.db_name)
-
 def lambda_handler(event, context):
+    connection = None
+    cursor = None
 
-    cursor = connection.cursor()
+    try:
+        connection = pymysql.connect(
+            host=dbinfo.db_host,
+            port=23306,
+            user=dbinfo.db_username,
+            passwd=dbinfo.db_password,
+            db=dbinfo.db_name
+        )
 
-    query = "SELECT COUNT(*) FROM frame_annotation_temp"
-    cursor.execute(query)
+        cursor = connection.cursor()
+        query = "SELECT COUNT(*) FROM frame_annotation_temp"
+        cursor.execute(query)
+        result = cursor.fetchone()
 
-    result = cursor.fetchone()
+        total_batch = (result[0] + 49999) // 50000
 
-    total_batch = (result[0] + 49999) // 50000
+        output = {'batch_number': [i for i in range(total_batch)]}
+        return output
 
-    output = {'batch_number':[]}
-    
-    for i in range(total_batch):
-        output['batch_number'].append(i)
+    except Exception as e:
+        print("[ERROR] lambda_handler failed:", e)
+        raise e
 
-    cursor.close()
-    connection.close()
-
-    return output
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception as e:
+                print("[WARNING] cursor close failed:", e)
+        if connection:
+            try:
+                connection.close()
+            except Exception as e:
+                print("[WARNING] connection close failed:", e)
