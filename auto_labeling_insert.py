@@ -1,0 +1,788 @@
+"""
+auto_labeling_insert DAG
+
+KITTI auto-labeling API 결과(`output/{JOB_UUID}/*.json`) 를 읽어
+스테이징 DB(`auto_label`) 에 적재한 뒤 통합 DB(`adds`) 로 복사한다.
+
+트리거 예:
+    {"job_id": "7a34431e-8d99-4043-ba68-0f1a0f97cdc8"}
+
+상세 설계는 auto-labeling-api/docs/etl_mapping_transformation_rules.md 참조.
+"""
+
+from datetime import datetime, timedelta, timezone
+import glob
+import json
+import os
+import secrets
+import uuid
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+from airflow import DAG
+from airflow.models.param import Param
+from airflow.operators.python import PythonOperator
+from airflow.providers.mysql.hooks.mysql import MySqlHook
+
+
+KST = timezone(timedelta(hours=9))
+
+default_args = {
+    'owner': 'eun',
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+
+# --- 상수 -----------------------------------------------------------------
+
+OUTPUT_ROOT = "/home/ubuntu/auto-labeling-api/output"
+STAGING_DB = "auto_label"
+ADDS_DB = "adds"
+MYSQL_CONN_ID = "aws_mysql"
+
+DATASET_NAME = "KITTI Auto-Labeled"
+SENSOR_CHANNEL = "AUTO_LABEL_CAM"
+SENSOR_MODALITY = "camera"
+ANNOTATION_TYPE_NAME = "bbox_image2d"
+ANNOTATION_TYPE_DESC = "2D bounding box from KITTI auto-labeling"
+
+
+# --- 공통 헬퍼 ------------------------------------------------------------
+
+def get_job_id(kwargs):
+    """DAG 트리거 conf 로 전달된 job_id 반환."""
+    conf = kwargs['dag_run'].conf or {}
+    job_id = conf.get('job_id')
+    if not job_id:
+        raise ValueError("dag_run.conf['job_id'] 가 필요합니다.")
+    return job_id
+
+
+def list_json_files(job_id):
+    """해당 job 디렉토리의 JSON 파일을 파일명 오름차순으로 반환."""
+    pattern = os.path.join(OUTPUT_ROOT, job_id, "*.json")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"JSON 파일이 없습니다: {pattern}")
+    return files
+
+
+def _find_calib_line(original_calib, key):
+    for line in original_calib:
+        if line.startswith(f"{key}:"):
+            return line.split(":", 1)[1].strip()
+    raise ValueError(f"{key} 라인이 Original_calib 에 없습니다.")
+
+
+def parse_calib(original_calib):
+    """
+    Original_calib 리스트에서 P2/R0_rect/Tr_velo_to_cam 파싱.
+
+    반환:
+        camera_intrinsic: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]  (3×3 행렬)
+        translation:      [x, y, z]
+        rotation:         [w, x, y, z]
+    """
+    # P2: 3x4 (KITTI 전방 컬러 카메라) → 앞 3x3 = 내부 파라미터 행렬
+    p2_vals = [float(x) for x in _find_calib_line(original_calib, "P2").split()]
+    P2 = np.array(p2_vals).reshape(3, 4)
+    camera_intrinsic = P2[:, :3].tolist()
+
+    # Tr_velo_to_cam: 3x4 → 마지막 열 = 평행이동
+    tr_vals = [float(x) for x in _find_calib_line(original_calib, "Tr_velo_to_cam").split()]
+    Tr = np.array(tr_vals).reshape(3, 4)
+    translation = Tr[:, 3].tolist()
+
+    # R0_rect: 3x3 → 쿼터니언 [w, x, y, z] (scipy 는 [x,y,z,w] 순으로 반환)
+    r_vals = [float(x) for x in _find_calib_line(original_calib, "R0_rect").split()]
+    R = np.array(r_vals).reshape(3, 3)
+    q = Rotation.from_matrix(R).as_quat()
+    rotation = [q[3], q[0], q[1], q[2]]
+
+    return camera_intrinsic, translation, rotation
+
+
+def resolve_category_token(class_name, category_dict, cur):
+    """
+    bbox class 이름을 adds.category.token 으로 해석.
+
+    1) 완전 일치 (대소문자 무시)
+    2) suffix 매칭 (".class" 로 끝나는 name 탐색, 예: Car → vehicle.car)
+    3) fallback — 신규 token 생성
+
+    매칭 결과(정규화된 name)를 staging category 에 INSERT IGNORE 하여 결과 확인 가능.
+    """
+    def _insert_staging(name, token):
+        cur.execute(f"USE {STAGING_DB}")
+        cur.execute(
+            "INSERT IGNORE INTO category (token, name) VALUES (%s, %s)",
+            (token, name),
+        )
+
+    lower = class_name.lower()
+
+    for name, token in category_dict.items():
+        if name.lower() == lower:
+            print(f"[완전일치] '{class_name}' → '{name}'")
+            _insert_staging(name, token)
+            return token
+
+    suffix = f".{lower}"
+    matches = [(name, token) for name, token in category_dict.items()
+               if name.lower().endswith(suffix)]
+    if len(matches) == 1:
+        matched_name, matched_token = matches[0]
+        print(f"[suffix매칭] '{class_name}' → '{matched_name}'")
+        _insert_staging(matched_name, matched_token)
+        return matched_token
+    if len(matches) > 1:
+        print(f"[경고] category '{class_name}' 다중 매칭: "
+              f"{[m[0] for m in matches]}, 첫 번째 사용")
+        matched_name, matched_token = matches[0]
+        _insert_staging(matched_name, matched_token)
+        return matched_token
+
+    new_token = secrets.token_hex(16)
+    _insert_staging(class_name, new_token)
+    category_dict[class_name] = new_token
+    print(f"[신규] category 삽입: '{class_name}' → {new_token}")
+    return new_token
+
+
+# --- job_status 콜백 ------------------------------------------------------
+
+def _update_job_status(context, status: str) -> None:
+    """DAG 성공/실패 콜백에서 adds.job_status 를 업데이트한다."""
+    conf = (context['dag_run'].conf or {})
+    job_id = conf.get('job_id')
+    if not job_id:
+        print("[job_status] job_id 없음, 상태 업데이트 스킵")
+        return
+    try:
+        mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+        conn = mysql_hook.get_conn()
+        cur = conn.cursor()
+        cur.execute(f"USE {ADDS_DB}")
+        cur.execute(
+            "UPDATE job_status SET status = %s, updated_at = %s WHERE job_id = %s",
+            (status, datetime.now(KST), job_id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"[job_status] {status} | job_id={job_id}")
+    except Exception as exc:
+        print(f"[job_status] UPDATE failed | job_id={job_id} status={status} error={exc}")
+
+
+def on_dag_success(context) -> None:
+    _update_job_status(context, "COMPLETE")
+
+
+def on_dag_failure(context) -> None:
+    _update_job_status(context, "FAIL")
+
+
+# --- Task 구현 ------------------------------------------------------------
+
+def dataset_log_sensor_insert(**kwargs):
+    """
+    공유 마스터 1회 처리:
+      - dataset ("KITTI Auto-Labeled")  → auto_label (copy_to_adds 에서 adds 로 복사)
+      - log     (모든 job 공유 dummy)   → adds 직접
+      - sensor  (AUTO_LABEL_CAM / cam)  → adds 직접
+
+    각 token 을 XCom push.
+    """
+    ti = kwargs['ti']
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    # dataset: adds 에서 존재 확인 → staging 에 삽입
+    cur.execute(f"USE {ADDS_DB}")
+    cur.execute("SELECT token FROM dataset WHERE name = %s", (DATASET_NAME,))
+    row = cur.fetchone()
+    if row:
+        dataset_token = row[0]
+        print(f"[adds 확인] dataset_token = {dataset_token}")
+    else:
+        dataset_token = secrets.token_hex(16)
+        print(f"[신규] dataset_token = {dataset_token}")
+    cur.execute(f"USE {STAGING_DB}")
+    cur.execute(
+        "INSERT IGNORE INTO dataset (token, name) VALUES (%s, %s)",
+        (dataset_token, DATASET_NAME),
+    )
+
+    # log: adds 에서 존재 확인 → staging 에 삽입
+    cur.execute(f"USE {ADDS_DB}")
+    cur.execute(
+        "SELECT token FROM log WHERE dataset_token = %s AND device IS NULL "
+        "AND date_captured IS NULL AND location IS NULL",
+        (dataset_token,),
+    )
+    row = cur.fetchone()
+    if row:
+        log_token = row[0]
+        print(f"[adds 확인] log_token = {log_token}")
+    else:
+        log_token = secrets.token_hex(16)
+        print(f"[신규] log_token = {log_token}")
+    cur.execute(f"USE {STAGING_DB}")
+    cur.execute(
+        "INSERT IGNORE INTO log "
+        "(token, dataset_token, device, date_captured, location, "
+        " driving_distance, device_wlh, logfile) "
+        "VALUES (%s, %s, NULL, NULL, NULL, NULL, NULL, NULL)",
+        (log_token, dataset_token),
+    )
+
+    # sensor: adds 에서 존재 확인 → staging 에 삽입
+    cur.execute(f"USE {ADDS_DB}")
+    cur.execute(
+        "SELECT token FROM sensor WHERE channel = %s AND modality = %s",
+        (SENSOR_CHANNEL, SENSOR_MODALITY),
+    )
+    row = cur.fetchone()
+    if row:
+        sensor_token = row[0]
+        print(f"[adds 확인] sensor_token = {sensor_token}")
+    else:
+        sensor_token = secrets.token_hex(16)
+        print(f"[신규] sensor_token = {sensor_token}")
+    cur.execute(f"USE {STAGING_DB}")
+    cur.execute(
+        "INSERT IGNORE INTO sensor (token, channel, modality) VALUES (%s, %s, %s)",
+        (sensor_token, SENSOR_CHANNEL, SENSOR_MODALITY),
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    ti.xcom_push(key='dataset_token', value=dataset_token)
+    ti.xcom_push(key='log_token', value=log_token)
+    ti.xcom_push(key='sensor_token', value=sensor_token)
+
+
+def category_annotation_type_insert(**kwargs):
+    """
+    - adds.category 전체 조회하여 name→token 딕셔너리 XCom push (정규화 매칭용).
+      (신규 class 발견 시 fallback INSERT 는 adds 에 직접 삽입)
+    - adds.annotation_type 의 "bbox_image2d" 없으면 INSERT.
+    """
+    ti = kwargs['ti']
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    # category: adds 에서 전체 조회 (정규화 매칭용)
+    cur.execute(f"USE {ADDS_DB}")
+    cur.execute("SELECT name, token FROM category")
+    category_dict = {name: token for name, token in cur.fetchall()}
+    print(f"기존 category 수 (adds): {len(category_dict)}")
+
+    # annotation_type: adds 에서 존재 확인 → adds 값 그대로 staging 에 삽입
+    cur.execute("SELECT name, description FROM annotation_type WHERE name = %s", (ANNOTATION_TYPE_NAME,))
+    row = cur.fetchone()
+    if row:
+        at_name, at_desc = row
+        print(f"[adds 확인] annotation_type '{at_name}' 존재 → adds 값 사용")
+    else:
+        at_name, at_desc = ANNOTATION_TYPE_NAME, ANNOTATION_TYPE_DESC
+        print(f"[신규] annotation_type '{at_name}'")
+    cur.execute(f"USE {STAGING_DB}")
+    cur.execute(
+        "INSERT IGNORE INTO annotation_type (name, description) VALUES (%s, %s)",
+        (at_name, at_desc),
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    ti.xcom_push(key='category_dict', value=category_dict)
+
+
+def scene_insert(**kwargs):
+    """
+    Job UUID = scene 1건. first/last_frame_token 은 이후 UPDATE 로 채움.
+    auto_label.scene 에 INSERT IGNORE.
+
+    base_path 우선순위:
+      1) dag_run.conf['base_path']  — FastAPI 트리거 시 전달 (예: "v0.1/test_kitti/image_2/")
+      2) fallback: "output/{job_id}/"
+    """
+    ti = kwargs['ti']
+    job_id = get_job_id(kwargs)
+
+    log_token = ti.xcom_pull(task_ids='dataset_log_sensor_insert', key='log_token')
+    if not log_token:
+        raise ValueError("log_token 을 XCom 으로 받지 못했습니다.")
+
+    conf = kwargs['dag_run'].conf or {}
+    base_path = conf.get('base_path') or f"output/{job_id}/"
+
+    scene_token = uuid.UUID(job_id).hex
+    json_files = list_json_files(job_id)
+    num_frames = len(json_files)
+
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    cur.execute(f"USE {STAGING_DB}")
+    cur.execute(
+        "INSERT IGNORE INTO scene "
+        "(token, log_token, base_path, num_frames, "
+        " first_frame_token, last_frame_token, goal_ego_pose_token) "
+        "VALUES (%s, %s, %s, %s, NULL, NULL, NULL)",
+        (scene_token, log_token, base_path, num_frames),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(f"scene_token = {scene_token} / num_frames = {num_frames}")
+
+
+def calibrated_sensor_insert(**kwargs):
+    """
+    각 JSON 의 Original_calib 에서 P2/R0_rect/Tr_velo_to_cam 파싱.
+    JSON 파일 인덱스 순서와 동일한 calib_tokens 리스트를 XCom push.
+    """
+    ti = kwargs['ti']
+    job_id = get_job_id(kwargs)
+    sensor_token = ti.xcom_pull(task_ids='dataset_log_sensor_insert', key='sensor_token')
+    if not sensor_token:
+        raise ValueError("sensor_token 을 XCom 으로 받지 못했습니다.")
+
+    json_files = list_json_files(job_id)
+    calib_tokens = []
+    rows = []
+
+    for json_file in json_files:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        camera_intrinsic, translation, rotation = parse_calib(data["Original_calib"])
+
+        token = secrets.token_hex(16)
+        calib_tokens.append(token)
+        rows.append((
+            token,
+            sensor_token,
+            json.dumps(camera_intrinsic),
+            json.dumps(translation),
+            json.dumps(rotation),
+        ))
+
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    cur.execute(f"USE {STAGING_DB}")
+    cur.executemany(
+        "INSERT IGNORE INTO calibrated_sensor "
+        "(token, sensor_token, camera_intrinsic, translation, rotation, "
+        " height_from_ground, distortion) "
+        "VALUES (%s, %s, %s, %s, %s, NULL, NULL)",
+        rows,
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(f"calibrated_sensor {len(rows)} rows 삽입")
+    ti.xcom_push(key='calib_tokens', value=calib_tokens)
+
+
+def frame_insert(**kwargs):
+    """
+    패턴 C — frame_tokens 전체 선생성 후 linked list (prev/next) 로 배치 삽입.
+    """
+    ti = kwargs['ti']
+    job_id = get_job_id(kwargs)
+    scene_token = uuid.UUID(job_id).hex
+
+    json_files = list_json_files(job_id)
+    n = len(json_files)
+    frame_tokens = [secrets.token_hex(16) for _ in range(n)]
+
+    rows = []
+    for i in range(n):
+        prev_token = frame_tokens[i - 1] if i > 0 else None
+        next_token = frame_tokens[i + 1] if i < n - 1 else None
+        rows.append((frame_tokens[i], scene_token, prev_token, next_token))
+
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    cur.execute(f"USE {STAGING_DB}")
+    cur.executemany(
+        "INSERT IGNORE INTO frame "
+        "(token, timestamp, scene_token, prev, next) "
+        "VALUES (%s, NULL, %s, %s, %s)",
+        rows,
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(f"frame {n} rows 삽입")
+    ti.xcom_push(key='frame_tokens', value=frame_tokens)
+
+
+def frame_data_insert(**kwargs):
+    """
+    frame_data_tokens 선생성 + frame_tokens/calib_tokens 인덱스 대응.
+    Image_information (height/width/file_name/format) 사용.
+    """
+    ti = kwargs['ti']
+    job_id = get_job_id(kwargs)
+
+    calib_tokens = ti.xcom_pull(task_ids='calibrated_sensor_insert', key='calib_tokens')
+    frame_tokens = ti.xcom_pull(task_ids='frame_insert', key='frame_tokens')
+    if not calib_tokens or not frame_tokens:
+        raise ValueError("calib_tokens / frame_tokens XCom 수신 실패")
+
+    json_files = list_json_files(job_id)
+    n = len(json_files)
+    if not (len(calib_tokens) == len(frame_tokens) == n):
+        raise ValueError(
+            f"token 길이 불일치: json={n}, calib={len(calib_tokens)}, frame={len(frame_tokens)}"
+        )
+
+    frame_data_tokens = [secrets.token_hex(16) for _ in range(n)]
+    rows = []
+
+    for i, json_file in enumerate(json_files):
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        image_info = data["Auto_labeling"]["Image_information"]
+        height = image_info["height"]
+        width = image_info["width"]
+        file_name = image_info["file_name"]
+        file_format = image_info["format"]
+
+        prev_token = frame_data_tokens[i - 1] if i > 0 else None
+        next_token = frame_data_tokens[i + 1] if i < n - 1 else None
+
+        rows.append((
+            frame_data_tokens[i],
+            frame_tokens[i],
+            calib_tokens[i],
+            height,
+            width,
+            file_name,
+            file_format,
+            prev_token,
+            next_token,
+        ))
+
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    cur.execute(f"USE {STAGING_DB}")
+    cur.executemany(
+        "INSERT IGNORE INTO frame_data "
+        "(token, frame_token, ego_pose_token, calibrated_sensor_token, "
+        " timestamp, is_key_frame, height, width, file_name, file_format, prev, next) "
+        "VALUES (%s, %s, NULL, %s, NULL, 1, %s, %s, %s, %s, %s, %s)",
+        rows,
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(f"frame_data {n} rows 삽입")
+    ti.xcom_push(key='frame_data_tokens', value=frame_data_tokens)
+
+
+def scenario_scenarios_in_scene_insert(**kwargs):
+    """
+    프레임마다 Time / Weather 조합으로 scenario 1건 + scenarios_in_scene 1건 생성.
+    scenario → adds 직접, scenarios_in_scene → auto_label.
+    """
+    job_id = get_job_id(kwargs)
+    scene_token = uuid.UUID(job_id).hex
+    json_files = list_json_files(job_id)
+
+    scenario_rows = []   # (token, description)
+    sis_rows = []        # (scene_token, scenario_token)
+
+    for json_file in json_files:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        time_class = data["Auto_labeling"]["Time_information"]["class"]
+        weather_class = data["Auto_labeling"]["Weather_information"]["class"]
+        description = f"{time_class},{weather_class}"
+
+        scenario_token = secrets.token_hex(16)
+        scenario_rows.append((scenario_token, description))
+        sis_rows.append((scene_token, scenario_token))
+
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    # scenario + scenarios_in_scene: staging
+    cur.execute(f"USE {STAGING_DB}")
+    cur.executemany(
+        "INSERT IGNORE INTO scenario (token, description) VALUES (%s, %s)",
+        scenario_rows,
+    )
+    cur.executemany(
+        "INSERT IGNORE INTO scenarios_in_scene (scene_token, scenario_token) "
+        "VALUES (%s, %s)",
+        sis_rows,
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(f"scenario {len(scenario_rows)} / scenarios_in_scene {len(sis_rows)} rows 삽입")
+
+
+def instance_frame_annotation_new_insert(**kwargs):
+    """
+    bbox 1건 = instance 1건 (tracking 정보 없음).
+    instance.token / frame_annotation_new.token 을 미리 생성(패턴 E).
+    first/last_frame_annotation_token = fa_token, num_annotations = 1.
+    마지막에 scene.first/last_frame_token 을 UPDATE (패턴 D).
+    """
+    ti = kwargs['ti']
+    job_id = get_job_id(kwargs)
+    scene_token = uuid.UUID(job_id).hex
+
+    frame_tokens = ti.xcom_pull(task_ids='frame_insert', key='frame_tokens')
+    frame_data_tokens = ti.xcom_pull(task_ids='frame_data_insert', key='frame_data_tokens')
+    category_dict = ti.xcom_pull(
+        task_ids='category_annotation_type_insert', key='category_dict',
+    ) or {}
+
+    if not frame_tokens or not frame_data_tokens:
+        raise ValueError("frame_tokens / frame_data_tokens XCom 수신 실패")
+
+    json_files = list_json_files(job_id)
+    n = len(json_files)
+    if not (len(frame_tokens) == len(frame_data_tokens) == n):
+        raise ValueError(
+            f"token 길이 불일치: json={n}, frame={len(frame_tokens)}, "
+            f"frame_data={len(frame_data_tokens)}"
+        )
+
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    # resolve_category_token() 은 신규 class 발견 시 adds.category 에 직접 INSERT 한다.
+    instance_rows = []
+    fa_rows = []
+
+    for i, json_file in enumerate(json_files):
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        bbox_list = (
+            data["Auto_labeling"]["Detection_information"].get("bbox_info") or []
+        )
+
+        for bbox in bbox_list:
+            class_name = bbox["class"]
+            category_token = resolve_category_token(class_name, category_dict, cur)
+
+            inst_token = secrets.token_hex(16)
+            fa_token = secrets.token_hex(16)
+
+            instance_rows.append((
+                inst_token,
+                category_token,
+                fa_token,   # first
+                fa_token,   # last
+                1,          # num_annotations
+                None,       # size
+            ))
+
+            bbox_2d = [
+                bbox["bbox_x1"],
+                bbox["bbox_y1"],
+                bbox["bbox_x2"],
+                bbox["bbox_y2"],
+            ]
+
+            fa_rows.append((
+                fa_token,
+                frame_tokens[i],
+                frame_data_tokens[i],
+                inst_token,
+                ANNOTATION_TYPE_NAME,
+                json.dumps(bbox_2d),
+            ))
+
+    # resolve_category_token() 이 USE adds 로 전환했을 수 있으므로 staging 으로 복귀
+    cur.execute(f"USE {STAGING_DB}")
+
+    if instance_rows:
+        cur.executemany(
+            "INSERT IGNORE INTO instance "
+            "(token, category_token, first_frame_annotation_token, "
+            " last_frame_annotation_token, num_annotations, size) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            instance_rows,
+        )
+
+    if fa_rows:
+        cur.executemany(
+            "INSERT IGNORE INTO frame_annotation_new "
+            "(token, frame_token, frame_data_token, instance_token, "
+            " visibility_token, annotation_type_name, is_lidar_synced, "
+            " size_wlh, translation_center, rotation_orientation, "
+            " bbox_image3d, bbox_image2d, num_lidar_pts, num_radar_pts, "
+            " attribute_tokens, frame_aligned, description, prev, next, velocity) "
+            "VALUES (%s, %s, %s, %s, NULL, %s, NULL, "
+            "        NULL, NULL, NULL, NULL, %s, NULL, NULL, "
+            "        NULL, NULL, NULL, NULL, NULL, NULL)",
+            fa_rows,
+        )
+
+    # 패턴 D — scene.first/last_frame_token 확정
+    first_frame_token = frame_tokens[0]
+    last_frame_token = frame_tokens[-1]
+    cur.execute(
+        "UPDATE scene SET first_frame_token = %s, last_frame_token = %s "
+        "WHERE token = %s",
+        (first_frame_token, last_frame_token, scene_token),
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(
+        f"instance {len(instance_rows)} / frame_annotation_new {len(fa_rows)} rows 삽입, "
+        f"scene({scene_token}) first/last_frame_token 업데이트"
+    )
+
+
+def copy_to_adds(**kwargs):
+    """
+    스테이징 DB(auto_label) 의 job별 데이터를 adds 로 복사.
+    log/sensor/category/annotation_type/scenario 는 이미 adds 에 직접 삽입했으므로 제외.
+
+    [테스트 중 비활성화 — adds 복사는 검증 완료 후 주석 해제]
+    """
+    print("[skip] copy_to_adds 는 현재 비활성화 상태입니다. 테스트 완료 후 주석을 해제하세요.")
+
+    # tables = [
+    #     'dataset',
+    #     'log',
+    #     'sensor',
+    #     'category',
+    #     'annotation_type',
+    #     'scene',
+    #     'calibrated_sensor',
+    #     'frame',
+    #     'frame_data',
+    #     'scenario',
+    #     'scenarios_in_scene',
+    #     'instance',
+    #     'frame_annotation_new',
+    # ]
+    #
+    # mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    # conn = mysql_hook.get_conn()
+    # cur = conn.cursor()
+    #
+    # for table in tables:
+    #     sql = f"INSERT IGNORE INTO {ADDS_DB}.{table} SELECT * FROM {STAGING_DB}.{table}"
+    #     print(f"[copy] {sql}")
+    #     cur.execute(sql)
+    #     conn.commit()
+    #
+    # cur.close()
+    # conn.close()
+
+
+# --- DAG ------------------------------------------------------------------
+
+with DAG(
+    'auto_labeling_insert',
+    default_args=default_args,
+    description='KITTI auto-labeling API 결과를 auto_label → adds 로 적재',
+    schedule_interval=None,
+    params={
+        "job_id": Param("", type="string", description="Job ID를 입력하세요"),
+        "base_path": Param("", type="string", description="S3 이미지 경로 prefix (예: v0.1/test_kitti/image_2/)"),
+    },
+    on_success_callback=on_dag_success,
+    on_failure_callback=on_dag_failure,
+    catchup=False,
+    tags=['auto_labeling', 'adds'],
+) as dag:
+
+    dataset_log_sensor_insert_task = PythonOperator(
+        task_id='dataset_log_sensor_insert',
+        python_callable=dataset_log_sensor_insert,
+    )
+
+    category_annotation_type_insert_task = PythonOperator(
+        task_id='category_annotation_type_insert',
+        python_callable=category_annotation_type_insert,
+    )
+
+    scene_insert_task = PythonOperator(
+        task_id='scene_insert',
+        python_callable=scene_insert,
+    )
+
+    calibrated_sensor_insert_task = PythonOperator(
+        task_id='calibrated_sensor_insert',
+        python_callable=calibrated_sensor_insert,
+    )
+
+    frame_insert_task = PythonOperator(
+        task_id='frame_insert',
+        python_callable=frame_insert,
+    )
+
+    frame_data_insert_task = PythonOperator(
+        task_id='frame_data_insert',
+        python_callable=frame_data_insert,
+    )
+
+    scenario_scenarios_in_scene_insert_task = PythonOperator(
+        task_id='scenario_scenarios_in_scene_insert',
+        python_callable=scenario_scenarios_in_scene_insert,
+    )
+
+    instance_frame_annotation_new_insert_task = PythonOperator(
+        task_id='instance_frame_annotation_new_insert',
+        python_callable=instance_frame_annotation_new_insert,
+    )
+
+    copy_to_adds_task = PythonOperator(
+        task_id='copy_to_adds',
+        python_callable=copy_to_adds,
+    )
+
+    # 의존성
+    [dataset_log_sensor_insert_task, category_annotation_type_insert_task] >> scene_insert_task
+    scene_insert_task >> [calibrated_sensor_insert_task, frame_insert_task] >> frame_data_insert_task
+    frame_data_insert_task >> [
+        scenario_scenarios_in_scene_insert_task,
+        instance_frame_annotation_new_insert_task,
+    ]
+    category_annotation_type_insert_task >> instance_frame_annotation_new_insert_task
+    [
+        scenario_scenarios_in_scene_insert_task,
+        instance_frame_annotation_new_insert_task,
+    ] >> copy_to_adds_task
