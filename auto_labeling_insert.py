@@ -40,6 +40,7 @@ default_args = {
 OUTPUT_ROOT = "/home/ubuntu/auto-labeling-api/output"
 STAGING_DB = "auto_label"
 ADDS_DB = "adds"
+PROVENANCE_DB = "adds_provenance"
 MYSQL_CONN_ID = "aws_mysql"
 
 DATASET_NAME = "KITTI Auto-Labeled"
@@ -510,6 +511,7 @@ def scenario_scenarios_in_scene_insert(**kwargs):
     프레임마다 Time / Weather 조합으로 scenario 1건 + scenarios_in_scene 1건 생성.
     scenario → adds 직접, scenarios_in_scene → auto_label.
     """
+    ti = kwargs['ti']
     job_id = get_job_id(kwargs)
     scene_token = uuid.UUID(job_id).hex
     json_files = list_json_files(job_id)
@@ -550,6 +552,7 @@ def scenario_scenarios_in_scene_insert(**kwargs):
     conn.close()
 
     print(f"scenario {len(scenario_rows)} / scenarios_in_scene {len(sis_rows)} rows 삽입")
+    ti.xcom_push(key='scenario_added_rows', value=len(scenario_rows))
 
 
 def instance_frame_annotation_new_insert(**kwargs):
@@ -585,6 +588,7 @@ def instance_frame_annotation_new_insert(**kwargs):
     cur = conn.cursor()
 
     # resolve_category_token() 은 신규 class 발견 시 adds.category 에 직접 INSERT 한다.
+    initial_category_count = len(category_dict)
     instance_rows = []
     fa_rows = []
 
@@ -671,6 +675,9 @@ def instance_frame_annotation_new_insert(**kwargs):
         f"instance {len(instance_rows)} / frame_annotation_new {len(fa_rows)} rows 삽입, "
         f"scene({scene_token}) first/last_frame_token 업데이트"
     )
+    ti.xcom_push(key='instance_count', value=len(instance_rows))
+    ti.xcom_push(key='frame_annotation_count', value=len(fa_rows))
+    ti.xcom_push(key='new_category_count', value=len(category_dict) - initial_category_count)
 
 
 def copy_to_adds(**kwargs):
@@ -710,6 +717,139 @@ def copy_to_adds(**kwargs):
     #
     # cur.close()
     # conn.close()
+
+
+def provenance_insert(**kwargs):
+    """
+    파이프라인 최종 단계 — 이력 관리 3개 테이블 일괄 INSERT.
+      1) dataset_versions : 신규 버전 발급
+      2) dataset_changes  : 테이블별 추가 행 기록 (XCom에서 카운트 수집)
+      3) dataset_provenance : 출처 및 처리 경로 기록
+    """
+    ti = kwargs['ti']
+    job_id = get_job_id(kwargs)
+    conf = kwargs['dag_run'].conf or {}
+
+    # --- XCom pull --------------------------------------------------------
+    dataset_token = ti.xcom_pull(
+        task_ids='dataset_log_sensor_insert', key='dataset_token',
+    )
+    calib_tokens = ti.xcom_pull(
+        task_ids='calibrated_sensor_insert', key='calib_tokens',
+    ) or []
+    frame_tokens = ti.xcom_pull(
+        task_ids='frame_insert', key='frame_tokens',
+    ) or []
+    frame_data_tokens = ti.xcom_pull(
+        task_ids='frame_data_insert', key='frame_data_tokens',
+    ) or []
+    scenario_added_rows = ti.xcom_pull(
+        task_ids='scenario_scenarios_in_scene_insert', key='scenario_added_rows',
+    ) or 0
+    instance_count = ti.xcom_pull(
+        task_ids='instance_frame_annotation_new_insert', key='instance_count',
+    ) or 0
+    frame_annotation_count = ti.xcom_pull(
+        task_ids='instance_frame_annotation_new_insert', key='frame_annotation_count',
+    ) or 0
+    new_category_count = ti.xcom_pull(
+        task_ids='instance_frame_annotation_new_insert', key='new_category_count',
+    ) or 0
+
+    # dataset_changes 대상 테이블 및 추가 행 수 (0이면 INSERT 스킵)
+    table_counts = [
+        ('scene',                1),
+        ('calibrated_sensor',    len(calib_tokens)),
+        ('frame',                len(frame_tokens)),
+        ('frame_data',           len(frame_data_tokens)),
+        ('scenario',             scenario_added_rows),
+        ('scenarios_in_scene',   scenario_added_rows),
+        ('instance',             instance_count),
+        ('frame_annotation_new', frame_annotation_count),
+        ('category',             new_category_count),
+    ]
+
+    # source: base_path 에서 zip 파일명 파싱
+    base_path = conf.get('base_path', '')
+    parts = base_path.strip('/').split('/')
+    source = parts[1] + '.zip' if len(parts) > 1 else base_path
+
+    executed_by = conf.get('user_id') or 'unknown'
+
+    now = datetime.now(KST)
+
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+    cur.execute(f"USE {PROVENANCE_DB}")
+
+    # --- 1) dataset_versions ----------------------------------------------
+    # 직전 버전 조회
+    cur.execute(
+        "SELECT version_id, version_name FROM dataset_versions "
+        "ORDER BY created_at DESC LIMIT 1"
+    )
+    prev_row = cur.fetchone()
+    if not prev_row:
+        raise ValueError(
+            "dataset_versions 에 기준 버전이 없습니다. "
+            "clear_auto_label_staging.sql 실행 후 재시도하세요."
+        )
+    from_version_id, prev_name = prev_row
+    # v{major}.{minor} 파싱 후 minor +1
+    try:
+        major, minor = prev_name.lstrip('v').split('.')
+        version_name = f"v{major}.{int(minor) + 1}"
+    except Exception:
+        version_name = f"{prev_name}_next"
+
+    new_version_id = str(uuid.uuid4())
+    cur.execute(
+        "INSERT INTO dataset_versions (version_id, version_name, created_by, created_at, updated_at) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (new_version_id, version_name, executed_by, now, now),
+    )
+    print(f"[dataset_versions] {version_name} (id={new_version_id})")
+
+    # --- 2) dataset_changes -----------------------------------------------
+    changes_inserted = 0
+    for table_name, added_rows in table_counts:
+        if added_rows == 0:
+            print(f"[dataset_changes] {table_name}: 0 rows, 스킵")
+            continue
+        change_id = str(uuid.uuid4())
+        change_log = str(added_rows)
+        cur.execute(
+            "INSERT INTO dataset_changes "
+            "(change_id, from_version_id, to_version_id, change_category, "
+            " change_action, target, change_log, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (change_id, from_version_id, new_version_id,
+             'row', 'add', table_name, change_log, now, now),
+        )
+        print(f"[dataset_changes] {table_name}: {change_log}")
+        changes_inserted += 1
+
+    # --- 3) dataset_provenance --------------------------------------------
+    provenance_id = str(uuid.uuid4())
+    cur.execute(
+        "INSERT INTO dataset_provenance "
+        "(provenance_id, version_id, source, processing_step, "
+        " ingestion_mode, executed_by, created_at, updated_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (provenance_id, new_version_id, source,
+         'auto_labeling', 'system', executed_by, now, now),
+    )
+    print(f"[dataset_provenance] source={source}, version={version_name}")
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(
+        f"provenance_insert 완료 | version={version_name} | "
+        f"changes={changes_inserted}건 | job_id={job_id}"
+    )
 
 
 # --- DAG ------------------------------------------------------------------
@@ -774,6 +914,11 @@ with DAG(
         python_callable=copy_to_adds,
     )
 
+    provenance_insert_task = PythonOperator(
+        task_id='provenance_insert',
+        python_callable=provenance_insert,
+    )
+
     # 의존성
     [dataset_log_sensor_insert_task, category_annotation_type_insert_task] >> scene_insert_task
     scene_insert_task >> [calibrated_sensor_insert_task, frame_insert_task] >> frame_data_insert_task
@@ -786,3 +931,4 @@ with DAG(
         scenario_scenarios_in_scene_insert_task,
         instance_frame_annotation_new_insert_task,
     ] >> copy_to_adds_task
+    copy_to_adds_task >> provenance_insert_task
