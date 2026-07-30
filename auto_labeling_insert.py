@@ -4,6 +4,16 @@ auto_labeling_insert DAG
 KITTI auto-labeling API 결과(`output/{JOB_UUID}/*.json`) 를 읽어
 스테이징 DB(`auto_label`) 에 적재한 뒤 통합 DB(`adds`) 로 복사한다.
 
+테이블 분류:
+  - 공유 마스터 (dataset / sensor / category / annotation_type)
+      → adds 에 직접 조회·삽입. 있으면 기존 token 재사용, staging 을 거치지 않는다.
+  - 업로드(job) 단위 (log / scene / calibrated_sensor / frame / frame_data /
+                      scenario / scenarios_in_scene / instance / frame_annotation_new)
+      → staging 에 적재 후 copy_to_adds 가 이번 job 것만 adds 로 복사.
+
+모든 token 은 자연키 기반 결정적 값(stable_token)이라 DAG 재실행 시 중복이 생기지
+않는다. 단, 같은 ZIP 을 다시 업로드하면 job_id 가 달라져 별개 데이터로 적재된다.
+
 트리거 예:
     {"job_id": "7a34431e-8d99-4043-ba68-0f1a0f97cdc8"}
 
@@ -12,9 +22,9 @@ KITTI auto-labeling API 결과(`output/{JOB_UUID}/*.json`) 를 읽어
 
 from datetime import datetime, timedelta, timezone
 import glob
+import hashlib
 import json
 import os
-import secrets
 import uuid
 
 import numpy as np
@@ -51,6 +61,18 @@ ANNOTATION_TYPE_DESC = "2D bounding box from KITTI auto-labeling"
 
 
 # --- 공통 헬퍼 ------------------------------------------------------------
+
+def stable_token(*parts):
+    """
+    자연키로부터 결정적 token(char(32)) 생성.
+
+    같은 입력이면 항상 같은 값이 나오므로 INSERT IGNORE 가 실제로 중복을 걸러낸다.
+    (랜덤 토큰은 절대 충돌하지 않아 IGNORE 가 무력해지고, DAG 재실행 시
+     scene 을 제외한 모든 테이블이 2배로 늘어난다.)
+    """
+    key = "|".join(str(p) for p in parts)
+    return hashlib.md5(key.encode('utf-8')).hexdigest()
+
 
 def get_job_id(kwargs):
     """DAG 트리거 conf 로 전달된 job_id 반환."""
@@ -111,23 +133,15 @@ def resolve_category_token(class_name, category_dict, cur):
 
     1) 완전 일치 (대소문자 무시)
     2) suffix 매칭 (".class" 로 끝나는 name 탐색, 예: Car → vehicle.car)
-    3) fallback — 신규 token 생성
+    3) fallback — adds.category 에 신규 삽입
 
-    매칭 결과(정규화된 name)를 staging category 에 INSERT IGNORE 하여 결과 확인 가능.
+    매칭된 경우는 adds 의 기존 token 을 그대로 재사용하므로 삽입하지 않는다.
     """
-    def _insert_staging(name, token):
-        cur.execute(f"USE {STAGING_DB}")
-        cur.execute(
-            "INSERT IGNORE INTO category (token, name) VALUES (%s, %s)",
-            (token, name),
-        )
-
     lower = class_name.lower()
 
     for name, token in category_dict.items():
         if name.lower() == lower:
             print(f"[완전일치] '{class_name}' → '{name}'")
-            _insert_staging(name, token)
             return token
 
     suffix = f".{lower}"
@@ -136,19 +150,23 @@ def resolve_category_token(class_name, category_dict, cur):
     if len(matches) == 1:
         matched_name, matched_token = matches[0]
         print(f"[suffix매칭] '{class_name}' → '{matched_name}'")
-        _insert_staging(matched_name, matched_token)
         return matched_token
     if len(matches) > 1:
         print(f"[경고] category '{class_name}' 다중 매칭: "
               f"{[m[0] for m in matches]}, 첫 번째 사용")
-        matched_name, matched_token = matches[0]
-        _insert_staging(matched_name, matched_token)
-        return matched_token
+        return matches[0][1]
 
-    new_token = secrets.token_hex(16)
-    _insert_staging(class_name, new_token)
+    # fallback — 공유 마스터이므로 adds 에 직접 삽입한다.
+    # staging 에만 넣으면 copy_to_adds 전까지 adds 에서 조회되지 않아
+    # 다음 실행에서 같은 class 에 또 새 토큰이 발급된다(중복 누적).
+    new_token = stable_token('category', class_name)
+    cur.execute(f"USE {ADDS_DB}")
+    cur.execute(
+        "INSERT IGNORE INTO category (token, name) VALUES (%s, %s)",
+        (new_token, class_name),
+    )
     category_dict[class_name] = new_token
-    print(f"[신규] category 삽입: '{class_name}' → {new_token}")
+    print(f"[신규] adds.category 삽입: '{class_name}' → {new_token}")
     return new_token
 
 
@@ -190,48 +208,61 @@ def on_dag_failure(context) -> None:
 
 def dataset_log_sensor_insert(**kwargs):
     """
-    공유 마스터 1회 처리:
-      - dataset ("KITTI Auto-Labeled")  → auto_label (copy_to_adds 에서 adds 로 복사)
-      - log     (모든 job 공유 dummy)   → adds 직접
-      - sensor  (AUTO_LABEL_CAM / cam)  → adds 직접
+    - dataset ("KITTI Auto-Labeled") : 공유 마스터 → adds 직접 (있으면 재사용)
+    - sensor  (AUTO_LABEL_CAM / cam) : 공유 마스터 → adds 직접 (있으면 재사용)
+    - log     (업로드당 1건)          : job 단위   → staging
+
+    공유 마스터를 staging 이 아니라 adds 에 직접 넣는 이유:
+    staging 에만 넣으면 copy_to_adds 가 돌기 전까지 adds 에서 조회되지 않아
+    실행마다 새 토큰이 발급된다(dataset 6건 중복의 원인이었다).
 
     각 token 을 XCom push.
     """
     ti = kwargs['ti']
+    job_id = get_job_id(kwargs)
     mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
     conn = mysql_hook.get_conn()
     cur = conn.cursor()
 
-    # dataset: adds 에서 존재 확인 → staging 에 삽입
     cur.execute(f"USE {ADDS_DB}")
+
+    # dataset: adds 에 있으면 그 token 사용, 없으면 adds 에 삽입.
+    # adds.dataset 에는 UNIQUE 제약이 없어 SELECT 결과에만 의존한다.
+    # (동시 실행 시 중복 가능 — UNIQUE(name) 추가는 별도 작업)
     cur.execute("SELECT token FROM dataset WHERE name = %s", (DATASET_NAME,))
     row = cur.fetchone()
     if row:
         dataset_token = row[0]
-        print(f"[adds 확인] dataset_token = {dataset_token}")
+        print(f"[adds 재사용] dataset_token = {dataset_token}")
     else:
-        dataset_token = secrets.token_hex(16)
-        print(f"[신규] dataset_token = {dataset_token}")
-    cur.execute(f"USE {STAGING_DB}")
-    cur.execute(
-        "INSERT IGNORE INTO dataset (token, name) VALUES (%s, %s)",
-        (dataset_token, DATASET_NAME),
-    )
+        dataset_token = stable_token('dataset', DATASET_NAME)
+        cur.execute(
+            "INSERT INTO dataset (token, name) VALUES (%s, %s)",
+            (dataset_token, DATASET_NAME),
+        )
+        print(f"[adds 신규] dataset_token = {dataset_token}")
 
-    # log: adds 에서 존재 확인 → staging 에 삽입
-    cur.execute(f"USE {ADDS_DB}")
+    # sensor: 동일 패턴 (PK = token)
     cur.execute(
-        "SELECT token FROM log WHERE dataset_token = %s AND device IS NULL "
-        "AND date_captured IS NULL AND location IS NULL",
-        (dataset_token,),
+        "SELECT token FROM sensor WHERE channel = %s AND modality = %s",
+        (SENSOR_CHANNEL, SENSOR_MODALITY),
     )
     row = cur.fetchone()
     if row:
-        log_token = row[0]
-        print(f"[adds 확인] log_token = {log_token}")
+        sensor_token = row[0]
+        print(f"[adds 재사용] sensor_token = {sensor_token}")
     else:
-        log_token = secrets.token_hex(16)
-        print(f"[신규] log_token = {log_token}")
+        sensor_token = stable_token('sensor', SENSOR_CHANNEL, SENSOR_MODALITY)
+        cur.execute(
+            "INSERT IGNORE INTO sensor (token, channel, modality) VALUES (%s, %s, %s)",
+            (sensor_token, SENSOR_CHANNEL, SENSOR_MODALITY),
+        )
+        print(f"[adds 신규] sensor_token = {sensor_token}")
+
+    # log: 업로드(job)당 1건. 서로 무관한 업로드를 하나의 주행 기록으로 묶지 않는다.
+    # device/date_captured/location 은 알 수 없어 NULL.
+    # logfile 은 원본 수집 로그 파일명을 담는 컬럼이므로 여기서는 쓰지 않는다.
+    log_token = stable_token('log', job_id)
     cur.execute(f"USE {STAGING_DB}")
     cur.execute(
         "INSERT IGNORE INTO log "
@@ -240,25 +271,7 @@ def dataset_log_sensor_insert(**kwargs):
         "VALUES (%s, %s, NULL, NULL, NULL, NULL, NULL, NULL)",
         (log_token, dataset_token),
     )
-
-    # sensor: adds 에서 존재 확인 → staging 에 삽입
-    cur.execute(f"USE {ADDS_DB}")
-    cur.execute(
-        "SELECT token FROM sensor WHERE channel = %s AND modality = %s",
-        (SENSOR_CHANNEL, SENSOR_MODALITY),
-    )
-    row = cur.fetchone()
-    if row:
-        sensor_token = row[0]
-        print(f"[adds 확인] sensor_token = {sensor_token}")
-    else:
-        sensor_token = secrets.token_hex(16)
-        print(f"[신규] sensor_token = {sensor_token}")
-    cur.execute(f"USE {STAGING_DB}")
-    cur.execute(
-        "INSERT IGNORE INTO sensor (token, channel, modality) VALUES (%s, %s, %s)",
-        (sensor_token, SENSOR_CHANNEL, SENSOR_MODALITY),
-    )
+    print(f"[업로드당 1건] log_token = {log_token}")
 
     conn.commit()
     cur.close()
@@ -272,8 +285,8 @@ def dataset_log_sensor_insert(**kwargs):
 def category_annotation_type_insert(**kwargs):
     """
     - adds.category 전체 조회하여 name→token 딕셔너리 XCom push (정규화 매칭용).
-      (신규 class 발견 시 fallback INSERT 는 adds 에 직접 삽입)
-    - adds.annotation_type 의 "bbox_image2d" 없으면 INSERT.
+      신규 class 는 resolve_category_token() 이 adds 에 직접 삽입한다.
+    - adds.annotation_type 에 "bbox_image2d" 없으면 adds 에 직접 삽입.
     """
     ti = kwargs['ti']
     mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
@@ -286,20 +299,13 @@ def category_annotation_type_insert(**kwargs):
     category_dict = {name: token for name, token in cur.fetchall()}
     print(f"기존 category 수 (adds): {len(category_dict)}")
 
-    # annotation_type: adds 에서 존재 확인 → adds 값 그대로 staging 에 삽입
-    cur.execute("SELECT name, description FROM annotation_type WHERE name = %s", (ANNOTATION_TYPE_NAME,))
-    row = cur.fetchone()
-    if row:
-        at_name, at_desc = row
-        print(f"[adds 확인] annotation_type '{at_name}' 존재 → adds 값 사용")
-    else:
-        at_name, at_desc = ANNOTATION_TYPE_NAME, ANNOTATION_TYPE_DESC
-        print(f"[신규] annotation_type '{at_name}'")
-    cur.execute(f"USE {STAGING_DB}")
+    # annotation_type: PK 가 name 이므로 INSERT IGNORE 로 충분하다.
+    # 이미 있으면 adds 의 기존 description 이 그대로 유지된다.
     cur.execute(
         "INSERT IGNORE INTO annotation_type (name, description) VALUES (%s, %s)",
-        (at_name, at_desc),
+        (ANNOTATION_TYPE_NAME, ANNOTATION_TYPE_DESC),
     )
+    print(f"[adds] annotation_type '{ANNOTATION_TYPE_NAME}' 확인/삽입")
 
     conn.commit()
     cur.close()
@@ -365,13 +371,13 @@ def calibrated_sensor_insert(**kwargs):
     calib_tokens = []
     rows = []
 
-    for json_file in json_files:
+    for i, json_file in enumerate(json_files):
         with open(json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
         camera_intrinsic, translation, rotation = parse_calib(data["Original_calib"])
 
-        token = secrets.token_hex(16)
+        token = stable_token('calibrated_sensor', job_id, i)
         calib_tokens.append(token)
         rows.append((
             token,
@@ -411,7 +417,7 @@ def frame_insert(**kwargs):
 
     json_files = list_json_files(job_id)
     n = len(json_files)
-    frame_tokens = [secrets.token_hex(16) for _ in range(n)]
+    frame_tokens = [stable_token('frame', job_id, i) for i in range(n)]
 
     rows = []
     for i in range(n):
@@ -458,7 +464,7 @@ def frame_data_insert(**kwargs):
             f"token 길이 불일치: json={n}, calib={len(calib_tokens)}, frame={len(frame_tokens)}"
         )
 
-    frame_data_tokens = [secrets.token_hex(16) for _ in range(n)]
+    frame_data_tokens = [stable_token('frame_data', job_id, i) for i in range(n)]
     rows = []
 
     for i, json_file in enumerate(json_files):
@@ -508,14 +514,22 @@ def frame_data_insert(**kwargs):
 
 def scenario_scenarios_in_scene_insert(**kwargs):
     """
-    프레임마다 Time / Weather 조합으로 scenario 1건 + scenarios_in_scene 1건 생성.
-    scenario → adds 직접, scenarios_in_scene → auto_label.
+    Time / Weather 조합을 job 내 distinct 단위로 scenario 1건 + scenarios_in_scene 1건 생성.
+    둘 다 staging 에 삽입.
+
+    프레임마다 만들지 않는 이유: scenarios_in_scene 은 scene↔scenario 만 연결하고
+    프레임과 연결하는 컬럼이 없다. 따라서 같은 scene 아래 description 이 동일한
+    행들은 애초에 구별이 불가능하므로, 1건으로 합쳐도 조회 가능한 정보는 같다.
+
+    중복 제거 범위는 job 내부다. job_id 를 토큰에 포함시키므로 adds.scenario
+    전역을 조회할 필요 없이 job 간에는 자동으로 분리된다.
     """
     ti = kwargs['ti']
     job_id = get_job_id(kwargs)
     scene_token = uuid.UUID(job_id).hex
     json_files = list_json_files(job_id)
 
+    seen = {}            # description -> scenario_token
     scenario_rows = []   # (token, description)
     sis_rows = []        # (scene_token, scenario_token)
 
@@ -527,7 +541,11 @@ def scenario_scenarios_in_scene_insert(**kwargs):
         weather_class = data["Auto_labeling"]["Weather_information"]["class"]
         description = f"{time_class},{weather_class}"
 
-        scenario_token = secrets.token_hex(16)
+        if description in seen:
+            continue
+
+        scenario_token = stable_token('scenario', job_id, description)
+        seen[description] = scenario_token
         scenario_rows.append((scenario_token, description))
         sis_rows.append((scene_token, scenario_token))
 
@@ -551,7 +569,8 @@ def scenario_scenarios_in_scene_insert(**kwargs):
     cur.close()
     conn.close()
 
-    print(f"scenario {len(scenario_rows)} / scenarios_in_scene {len(sis_rows)} rows 삽입")
+    print(f"scenario {len(scenario_rows)} / scenarios_in_scene {len(sis_rows)} rows 삽입 "
+          f"(프레임 {len(json_files)}개 → distinct {len(scenario_rows)}개)")
     ti.xcom_push(key='scenario_added_rows', value=len(scenario_rows))
 
 
@@ -600,12 +619,12 @@ def instance_frame_annotation_new_insert(**kwargs):
             data["Auto_labeling"]["Detection_information"].get("bbox_info") or []
         )
 
-        for bbox in bbox_list:
+        for j, bbox in enumerate(bbox_list):
             class_name = bbox["class"]
             category_token = resolve_category_token(class_name, category_dict, cur)
 
-            inst_token = secrets.token_hex(16)
-            fa_token = secrets.token_hex(16)
+            inst_token = stable_token('instance', job_id, i, j)
+            fa_token = stable_token('frame_annotation', job_id, i, j)
 
             instance_rows.append((
                 inst_token,
@@ -682,41 +701,75 @@ def instance_frame_annotation_new_insert(**kwargs):
 
 def copy_to_adds(**kwargs):
     """
-    스테이징 DB(auto_label) 의 job별 데이터를 adds 로 복사.
-    log/sensor/category/annotation_type/scenario 는 이미 adds 에 직접 삽입했으므로 제외.
+    스테이징 DB(auto_label) 에서 **이번 job 의 데이터만** adds 로 복사.
 
-    [테스트 중 비활성화 — adds 복사는 검증 완료 후 주석 해제]
+    공유 마스터(dataset/sensor/category/annotation_type)는 각 태스크가 adds 에
+    직접 삽입하므로 복사 대상이 아니다.
+
+    job 필터가 필수인 이유: DAG 는 staging 을 비우지 않으므로 테이블 전체를
+    복사하면 실행마다 이전 job 행까지 재복사된다. adds.frame_annotation_new 는
+    PK 가 없어 INSERT IGNORE 로도 걸러지지 않는다.
+
+    재복사 방지: adds.scene 에 이번 scene_token 이 이미 있으면 전체를 스킵한다.
+    (커밋은 마지막에 1회만 하므로 "일부만 복사된" 중간 상태가 남지 않는다.)
     """
-    print("[skip] copy_to_adds 는 현재 비활성화 상태입니다. 테스트 완료 후 주석을 해제하세요.")
+    job_id = get_job_id(kwargs)
+    scene_token = uuid.UUID(job_id).hex
 
-    # tables = [
-    #     'dataset',
-    #     'log',
-    #     'sensor',
-    #     'category',
-    #     'annotation_type',
-    #     'scene',
-    #     'calibrated_sensor',
-    #     'frame',
-    #     'frame_data',
-    #     'scenario',
-    #     'scenarios_in_scene',
-    #     'instance',
-    #     'frame_annotation_new',
-    # ]
-    #
-    # mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
-    # conn = mysql_hook.get_conn()
-    # cur = conn.cursor()
-    #
-    # for table in tables:
-    #     sql = f"INSERT IGNORE INTO {ADDS_DB}.{table} SELECT * FROM {STAGING_DB}.{table}"
-    #     print(f"[copy] {sql}")
-    #     cur.execute(sql)
-    #     conn.commit()
-    #
-    # cur.close()
-    # conn.close()
+    # 이번 job 의 frame / frame_data token 집합 (staging 기준)
+    frame_subq = f"SELECT token FROM {STAGING_DB}.frame WHERE scene_token = %(scene)s"
+
+    # (테이블, WHERE 절) — FK 의존성 순서를 지킨다
+    steps = [
+        ('log',
+         f"token = (SELECT log_token FROM {STAGING_DB}.scene WHERE token = %(scene)s)"),
+        ('scene',
+         "token = %(scene)s"),
+        ('calibrated_sensor',
+         f"token IN (SELECT calibrated_sensor_token FROM {STAGING_DB}.frame_data "
+         f"          WHERE frame_token IN ({frame_subq}))"),
+        ('frame',
+         "scene_token = %(scene)s"),
+        ('frame_data',
+         f"frame_token IN ({frame_subq})"),
+        ('scenario',
+         f"token IN (SELECT scenario_token FROM {STAGING_DB}.scenarios_in_scene "
+         f"          WHERE scene_token = %(scene)s)"),
+        ('scenarios_in_scene',
+         "scene_token = %(scene)s"),
+        ('instance',
+         f"token IN (SELECT instance_token FROM {STAGING_DB}.frame_annotation_new "
+         f"          WHERE frame_token IN ({frame_subq}))"),
+        ('frame_annotation_new',
+         f"frame_token IN ({frame_subq})"),
+    ]
+
+    mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
+    conn = mysql_hook.get_conn()
+    cur = conn.cursor()
+
+    cur.execute(f"SELECT 1 FROM {ADDS_DB}.scene WHERE token = %s", (scene_token,))
+    if cur.fetchone():
+        print(f"[skip] 이미 adds 에 복사된 job 입니다 | scene_token={scene_token}")
+        cur.close()
+        conn.close()
+        return
+
+    total = 0
+    for table, where in steps:
+        sql = (
+            f"INSERT IGNORE INTO {ADDS_DB}.{table} "
+            f"SELECT * FROM {STAGING_DB}.{table} WHERE {where}"
+        )
+        cur.execute(sql, {'scene': scene_token})
+        print(f"[copy] {table}: {cur.rowcount} rows")
+        total += cur.rowcount
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    print(f"copy_to_adds 완료 | scene_token={scene_token} | 총 {total} rows")
 
 
 def provenance_insert(**kwargs):
@@ -758,6 +811,7 @@ def provenance_insert(**kwargs):
 
     # dataset_changes 대상 테이블 및 추가 행 수 (0이면 INSERT 스킵)
     table_counts = [
+        ('log',                  1),
         ('scene',                1),
         ('calibrated_sensor',    len(calib_tokens)),
         ('frame',                len(frame_tokens)),
