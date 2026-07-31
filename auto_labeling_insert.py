@@ -93,38 +93,61 @@ def list_json_files(job_id):
 
 
 def _find_calib_line(original_calib, key):
+    """찾으면 값 문자열, 못 찾으면 None. (calib 은 옵셔널이므로 예외를 던지지 않는다)"""
     for line in original_calib:
         if line.startswith(f"{key}:"):
             return line.split(":", 1)[1].strip()
-    raise ValueError(f"{key} 라인이 Original_calib 에 없습니다.")
+    return None
 
 
 def parse_calib(original_calib):
     """
     Original_calib 리스트에서 P2/R0_rect/Tr_velo_to_cam 파싱.
 
+    calib 은 옵셔널이다. 업로드에 calib/ 이 없으면 오토라벨링 API 가
+    Original_calib: [] 로 내려주며, 이 경우 세 값 모두 None 을 반환한다.
+    일부 라인만 없는 경우에도 해당 값만 None 이 되고 나머지는 정상 파싱한다.
+
     반환:
-        camera_intrinsic: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]  (3×3 행렬)
-        translation:      [x, y, z]
-        rotation:         [w, x, y, z]
+        camera_intrinsic: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]  (3×3 행렬) 또는 None
+        translation:      [x, y, z]                                        또는 None
+        rotation:         [w, x, y, z]                                     또는 None
     """
+    original_calib = original_calib or []
+
+    camera_intrinsic = translation = rotation = None
+
     # P2: 3x4 (KITTI 전방 컬러 카메라) → 앞 3x3 = 내부 파라미터 행렬
-    p2_vals = [float(x) for x in _find_calib_line(original_calib, "P2").split()]
-    P2 = np.array(p2_vals).reshape(3, 4)
-    camera_intrinsic = P2[:, :3].tolist()
+    p2_line = _find_calib_line(original_calib, "P2")
+    if p2_line:
+        P2 = np.array([float(x) for x in p2_line.split()]).reshape(3, 4)
+        camera_intrinsic = P2[:, :3].tolist()
 
     # Tr_velo_to_cam: 3x4 → 마지막 열 = 평행이동
-    tr_vals = [float(x) for x in _find_calib_line(original_calib, "Tr_velo_to_cam").split()]
-    Tr = np.array(tr_vals).reshape(3, 4)
-    translation = Tr[:, 3].tolist()
+    tr_line = _find_calib_line(original_calib, "Tr_velo_to_cam")
+    if tr_line:
+        Tr = np.array([float(x) for x in tr_line.split()]).reshape(3, 4)
+        translation = Tr[:, 3].tolist()
 
     # R0_rect: 3x3 → 쿼터니언 [w, x, y, z] (scipy 는 [x,y,z,w] 순으로 반환)
-    r_vals = [float(x) for x in _find_calib_line(original_calib, "R0_rect").split()]
-    R = np.array(r_vals).reshape(3, 3)
-    q = Rotation.from_matrix(R).as_quat()
-    rotation = [q[3], q[0], q[1], q[2]]
+    r_line = _find_calib_line(original_calib, "R0_rect")
+    if r_line:
+        R = np.array([float(x) for x in r_line.split()]).reshape(3, 3)
+        q = Rotation.from_matrix(R).as_quat()
+        rotation = [q[3], q[0], q[1], q[2]]
 
     return camera_intrinsic, translation, rotation
+
+
+def _json_or_none(value):
+    """
+    JSON 컬럼용 직렬화. value 가 None 이면 SQL NULL 로 넣기 위해 None 을 그대로 반환한다.
+
+    json.dumps(None) 은 문자열 'null' 을 만들고 MySQL JSON 컬럼은 이를 SQL NULL 이
+    아니라 "JSON null 값"으로 저장하기 때문에 IS NULL 조회에서 누락된다.
+    adds.calibrated_sensor 의 기존 행들은 모두 SQL NULL 관례를 따르므로 여기에 맞춘다.
+    """
+    return None if value is None else json.dumps(value)
 
 
 def resolve_category_token(class_name, category_dict, cur):
@@ -360,6 +383,10 @@ def calibrated_sensor_insert(**kwargs):
     """
     각 JSON 의 Original_calib 에서 P2/R0_rect/Tr_velo_to_cam 파싱.
     JSON 파일 인덱스 순서와 동일한 calib_tokens 리스트를 XCom push.
+
+    calib 이 없는 업로드에서도 행은 프레임마다 그대로 생성한다.
+    (calib 값 3개만 NULL) frame_data.calibrated_sensor_token → sensor 연결을
+    유지하고, 하류 태스크의 길이 검사·행 수 카운트를 그대로 쓸 수 있기 때문이다.
     """
     ti = kwargs['ti']
     job_id = get_job_id(kwargs)
@@ -370,21 +397,25 @@ def calibrated_sensor_insert(**kwargs):
     json_files = list_json_files(job_id)
     calib_tokens = []
     rows = []
+    no_calib_count = 0
 
     for i, json_file in enumerate(json_files):
         with open(json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        camera_intrinsic, translation, rotation = parse_calib(data["Original_calib"])
+        # calib 은 옵셔널 — 키 자체가 없거나 [] 이면 세 값 모두 None 이 된다.
+        camera_intrinsic, translation, rotation = parse_calib(data.get("Original_calib"))
+        if camera_intrinsic is None and translation is None and rotation is None:
+            no_calib_count += 1
 
         token = stable_token('calibrated_sensor', job_id, i)
         calib_tokens.append(token)
         rows.append((
             token,
             sensor_token,
-            json.dumps(camera_intrinsic),
-            json.dumps(translation),
-            json.dumps(rotation),
+            _json_or_none(camera_intrinsic),
+            _json_or_none(translation),
+            _json_or_none(rotation),
         ))
 
     mysql_hook = MySqlHook.get_hook(conn_id=MYSQL_CONN_ID)
@@ -403,7 +434,8 @@ def calibrated_sensor_insert(**kwargs):
     cur.close()
     conn.close()
 
-    print(f"calibrated_sensor {len(rows)} rows 삽입")
+    print(f"calibrated_sensor {len(rows)} rows 삽입 "
+          f"(calib 없음 {no_calib_count} rows — 보정값 3개 NULL)")
     ti.xcom_push(key='calib_tokens', value=calib_tokens)
 
 
